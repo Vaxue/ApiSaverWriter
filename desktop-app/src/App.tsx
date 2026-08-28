@@ -81,6 +81,15 @@ interface ChapterMemory {
   updatedAt: string;
 }
 
+interface BatchGenerationItem {
+  chapterNumber: number;
+  title: string;
+  status: 'pending' | 'outline' | 'writing' | 'memory' | 'complete' | 'error';
+  outline?: string;
+  content?: string;
+  memory?: string;
+}
+
 interface AIDetectionChapter {
   chapterId: number;
   chapterTitle: string;
@@ -484,6 +493,25 @@ const chapterDraftFromStream = (raw: string, depth = 0): string => {
     : value;
 };
 
+const batchChapterTitleFromOutline = (raw: string, chapterNumber: number): string => {
+  const text = chapterDraftFromStream(raw).replace(/```(?:markdown|text)?/giu, '').trim();
+  const heading = text.split(/\r?\n/u).map(line => line.trim()).find(line => /^#{1,6}\s*\S/u.test(line));
+  const candidate = (heading || '').replace(/^#{1,6}\s*/u, '').trim()
+    .replace(/^章纲\s*[|｜:：-]\s*/u, '').trim();
+  if (!candidate) return `第 ${chapterNumber} 章`;
+  const numbered = candidate.match(/^第\s*\d+\s*章(?:\s+|[：:、-])?(.*)$/u);
+  if (numbered) return `第 ${chapterNumber} 章${numbered[1]?.trim() ? ` ${numbered[1].trim()}` : ''}`;
+  return `第 ${chapterNumber} 章 ${candidate}`.trim();
+};
+
+const clampChapterContent = (content: string, maxCharacters: number) => {
+  const normalized = content.trim();
+  if (countNovelCharacters(normalized) <= maxCharacters) return normalized;
+  const characters = Array.from(normalized).slice(0, maxCharacters).join('');
+  const lastBreak = Math.max(characters.lastIndexOf('。'), characters.lastIndexOf('！'), characters.lastIndexOf('？'), characters.lastIndexOf('\n'));
+  return (lastBreak > maxCharacters * 0.72 ? characters.slice(0, lastBreak + 1) : characters).trim();
+};
+
 interface RuntimeUsageSummary {
   inputTokens: number;
   outputTokens: number;
@@ -565,6 +593,8 @@ interface AgentConfig {
   proxyEnabled: boolean;
   proxyURL: string;
   proxyBypassLocal: boolean;
+  /** Number of chapters before the immediate predecessor to merge into one summary. */
+  memorySummaryChapterCount: number;
 }
 
 const agentStageLabel: Record<AgentStage, string> = {
@@ -684,6 +714,7 @@ const normalizeAgentConfig = (value: unknown): AgentConfig => {
     proxyEnabled: parsed.proxyEnabled === true,
     proxyURL: typeof parsed.proxyURL === 'string' && parsed.proxyURL.trim() ? parsed.proxyURL : 'http://127.0.0.1:7897',
     proxyBypassLocal: parsed.proxyBypassLocal === true,
+    memorySummaryChapterCount: Math.max(0, Math.min(20, Number(parsed.memorySummaryChapterCount) || 5)),
   };
 };
 const agentNetworkParams = (config: AgentConfig) => ({
@@ -1450,7 +1481,14 @@ function App() {
   const [activeTagTab, setActiveTagTab] = useState<TagTab>('主分类');
   const [tagDraft, setTagDraft] = useState<Record<TagTab, string[]>>(defaultProjectTags);
   const [projectPendingDeletion, setProjectPendingDeletion] = useState<Project | null>(null);
+  const [chapterPendingDeletion, setChapterPendingDeletion] = useState<Chapter | null>(null);
   const [showNewSkillModal, setShowNewSkillModal] = useState(false);
+  const [showBatchGenerationModal, setShowBatchGenerationModal] = useState(false);
+  const [batchGenerationCount, setBatchGenerationCount] = useState('3');
+  const [batchGenerationProjectId, setBatchGenerationProjectId] = useState<number | null>(null);
+  const [batchGenerationRunning, setBatchGenerationRunning] = useState(false);
+  const [batchGenerationProgress, setBatchGenerationProgress] = useState('');
+  const [batchGenerationItems, setBatchGenerationItems] = useState<BatchGenerationItem[]>([]);
   const [skillEditingId, setSkillEditingId] = useState<number | string | null>(null);
   const [notice, setNotice] = useState<{ title: string; content: string } | null>(null);
   
@@ -1511,7 +1549,7 @@ function App() {
   }, [activeTab, rankingPlatform, fanqieCategories, agentConfig]);
 
   const [agentInstruction, setAgentInstruction] = useState('根据当前章节上下文继续创作，保持人物设定和时间线一致，并在结尾留下自然的悬念。');
-  const [outlineAgentInstruction, setOutlineAgentInstruction] = useState('根据作品设定和当前大纲内容补全结构，明确章节目标、冲突推进、人物动机和结尾钩子。');
+  const [outlineAgentInstruction, setOutlineAgentInstruction] = useState('根据上一章正文自动识别章节编号，生成下一章章纲；控制在700字以内（包括标点符号），明确承接、冲突、转折和章末钩子。');
   const [cardAgentInstruction, setCardAgentInstruction] = useState('根据作品设定、当前章节和已有卡片，补全这张知识卡的详细信息，保持设定一致。');
   const [outlineGenerating, setOutlineGenerating] = useState(false);
   const [agentStage, setAgentStage] = useState<AgentStage>('idle');
@@ -1542,7 +1580,7 @@ function App() {
     try { return JSON.parse(localStorage.getItem('writer-runtime-usage') || '') as RuntimeUsageSummary; } catch { return { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: new Date().toISOString() }; }
   });
   const [usageDays, setUsageDays] = useState<UsageDay[]>(() => { try { const value = JSON.parse(localStorage.getItem('writer-runtime-usage-days') || '[]'); return Array.isArray(value) ? value : []; } catch { return []; } });
-  const [settingsSection, setSettingsSection] = useState<'model' | 'network' | 'usage' | 'sync' | 'support' | 'tutorial'>('model');
+  const [settingsSection, setSettingsSection] = useState<'model' | 'writing' | 'network' | 'usage' | 'sync' | 'support' | 'tutorial'>('model');
   const [cloudRemotePath, setCloudRemotePath] = useState(() => {
     const saved = localStorage.getItem('cloud-remote-path');
     return !saved || saved === 'ApiSaverWriter/projects' ? 'ApiSaverWriter/backup' : saved;
@@ -3126,6 +3164,82 @@ function App() {
     setSelectedMemoryIds(recentMemoryIds(updated.memories, 1));
   };
 
+  const handleDeleteChapter = async () => {
+    if (!editingProject || !chapterPendingDeletion) return;
+    const deletedId = chapterPendingDeletion.id;
+    const deletedIndex = editingProject.chapters.findIndex(chapter => chapter.id === deletedId);
+    if (deletedIndex < 0) {
+      setChapterPendingDeletion(null);
+      return;
+    }
+    const deletedChapterNumber = chapterNumberFromText(chapterPendingDeletion.title) || deletedIndex + 1;
+    const chapters = editingProject.chapters.filter(chapter => chapter.id !== deletedId);
+    // Some older projects have stale chapterId links after chapters were moved.
+    // Use the title's chapter number as a second guard so deleting chapter N
+    // can never remove a neighboring chapter's memory or outline.
+    // Legacy projects can contain stale/duplicated chapterId links. Resolve one
+    // record per document type, preferring an explicit chapter number. Never
+    // delete every record sharing an old ID: unrelated chapters must survive.
+    const memoryCandidates = editingProject.memories
+      .map((memory, index) => ({ memory, index, number: memory.sourceChapterNumber || chapterNumberFromText(memory.chapterTitle) }))
+      .filter(({ memory, number }) => (String(memory.chapterId) === String(deletedId)
+        && (number === deletedChapterNumber || number === undefined)) || number === deletedChapterNumber);
+    const numberedMemory = memoryCandidates.find(candidate => candidate.number === deletedChapterNumber && String(candidate.memory.chapterId) === String(deletedId))
+      || memoryCandidates.find(candidate => candidate.number === deletedChapterNumber);
+    const memoryToRemove = numberedMemory || (memoryCandidates.length === 1 && memoryCandidates[0].number === undefined ? memoryCandidates[0] : undefined);
+    const memories = editingProject.memories.filter((_memory, index) => index !== memoryToRemove?.index);
+
+    const outlineCandidates = editingProject.outlines
+      .map((outline, index) => ({ outline, index, number: chapterNumberFromText(`${outline.title}\n${outline.content.slice(0, 500)}`) }))
+      .filter(({ outline, number }) => outline.kind === '章纲' && ((String(outline.chapterId) === String(deletedId)
+        && (number === deletedChapterNumber || number === undefined)) || number === deletedChapterNumber));
+    const numberedOutline = outlineCandidates.find(candidate => candidate.number === deletedChapterNumber && String(candidate.outline.chapterId) === String(deletedId))
+      || outlineCandidates.find(candidate => candidate.number === deletedChapterNumber);
+    const outlineToRemove = numberedOutline || (outlineCandidates.length === 1 && outlineCandidates[0].number === undefined ? outlineCandidates[0] : undefined);
+    const removedOutlineIds = new Set<number>(outlineToRemove ? [outlineToRemove.outline.id] : []);
+    const outlines = editingProject.outlines.filter(outline => !removedOutlineIds.has(outline.id));
+    const chapterNodeId = `chapter:${deletedId}`;
+    const graphNodes = editingProject.graphNodes.filter(node => node.id !== chapterNodeId);
+    const graphEdges = editingProject.graphEdges.filter(edge => edge.source !== chapterNodeId && edge.target !== chapterNodeId && !removedOutlineIds.has(Number(String(edge.source).replace('outline:', ''))) && !removedOutlineIds.has(Number(String(edge.target).replace('outline:', ''))));
+    const aiDetection = editingProject.aiDetection
+      ? (() => {
+        const chapters = editingProject.aiDetection.chapters.filter(item => item.chapterId !== deletedId);
+        const averageAIRate = chapters.length ? Math.round(chapters.reduce((sum, item) => sum + item.aiRate, 0) / chapters.length * 10) / 10 : 0;
+        return { ...editingProject.aiDetection, chapters, averageAIRate, level: chapters.length ? editingProject.aiDetection.level : '暂无检测', suggestion: chapters.length ? editingProject.aiDetection.suggestion : '暂无章节检测记录。', updatedAt: new Date().toISOString() };
+      })()
+      : undefined;
+    const updatedProject: Project = {
+      ...editingProject,
+      chapters,
+      outlines,
+      memories,
+      memoryDocuments: buildMemoryDocuments(memories, editingProject.memoryDocuments, true),
+      graphNodes,
+      graphEdges,
+      aiDetection,
+      wordCount: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
+      updatedAt: new Date().toISOString(),
+    };
+    const nextChapter = chapters[Math.min(deletedIndex, Math.max(0, chapters.length - 1))] ?? null;
+    const nextOutline = outlines.find(outline => outline.id === activeOutlineId) || outlines[0];
+    const snapshot = projects.map(project => project.id === updatedProject.id ? updatedProject : project);
+    setProjects(snapshot);
+    setEditingProject(updatedProject);
+    setActiveChapter(nextChapter);
+    setActiveOutlineId(nextOutline?.id ?? null);
+    setSelectedOutlineIds(current => current.filter(id => !removedOutlineIds.has(id)));
+    setActiveChapterMemoryId(nextChapter ? memories.find(memory => memory.chapterId === nextChapter.id)?.id ?? null : null);
+    setSelectedMemoryIds(recentMemoryIds(memories, 1));
+    setChapterPendingDeletion(null);
+    try {
+      if ('__TAURI_INTERNALS__' in window) await invoke<string>('save_projects', { projects: snapshot });
+      else localStorage.setItem('projects', JSON.stringify(snapshot));
+      setNotice({ title: '章节已删除', content: `已删除《${chapterPendingDeletion.title}》，相关章纲、记忆和图谱关系也已清理。` });
+    } catch (error) {
+      setNotice({ title: '章节已删除但保存失败', content: String(error) });
+    }
+  };
+
   const handleUpdateChapterContent = (content: string) => {
     if (!activeChapter || !editingProject) return;
     const wordCount = countNovelCharacters(content);
@@ -3525,6 +3639,54 @@ function App() {
     return [...primaryTerms, ...[...secondaryTerms].sort((left, right) => right.length - left.length)].slice(0, 40);
   };
 
+  // Keep card retrieval deterministic: explicit selections win, then cards whose
+  // stable names/aliases occur in the current task or immediate chapter context.
+  // Sending only compact card headers/content keeps the upstream prompt prefix
+  // stable and avoids requiring a manual picker for every chapter.
+  const rankCardsForChapter = (project: Project, chapter: Chapter | null, instruction: string, outlineText: string, previousMemory?: ChapterMemory) => {
+    const query = [chapter?.title || '', chapter?.content || '', instruction, outlineText, previousMemory?.summary || '', ...(previousMemory?.keywords || [])].join('\n').toLocaleLowerCase();
+    return project.cards.map(card => {
+      const terms = cardSearchTerms(card);
+      const title = card.title.trim().toLocaleLowerCase();
+      const titleHit = title.length >= 2 && query.includes(title) ? 80 : 0;
+      const termHits = terms.slice(0, 12).reduce((score, term) => score + (term.length >= 3 && query.includes(term.toLocaleLowerCase()) ? (term === card.title ? 24 : 4) : 0), 0);
+      const explicit = selectedCardIds.includes(card.id) ? 1000 : 0;
+      const typeBoost = /角色卡|地点卡|势力卡/u.test(card.type) ? 3 : 0;
+      return { card, score: explicit + titleHit + termHits + typeBoost };
+    }).filter(item => item.score > 0).sort((left, right) => right.score - left.score || left.card.id - right.card.id).slice(0, 10).map(item => item.card);
+  };
+
+  const buildEarlierMemorySummary = (project: Project, currentChapter: Chapter, count: number): MemoryDocument | undefined => {
+    const currentIndex = project.chapters.findIndex(item => item.id === currentChapter.id);
+    if (count <= 0 || currentIndex <= 1) return undefined;
+    const previousId = project.chapters[currentIndex - 1]?.id;
+    const memories = project.memories
+      .filter(memory => memory.chapterId !== currentChapter.id && memory.chapterId !== previousId)
+      .map(memory => ({ memory, index: project.chapters.findIndex(chapter => chapter.id === memory.chapterId) }))
+      .filter(item => item.index >= 0 && item.index < currentIndex - 1)
+      .sort((left, right) => right.index - left.index)
+      .slice(0, count)
+      .sort((left, right) => right.index - left.index);
+    if (!memories.length) return undefined;
+    const list = (value: unknown, limit = 3) => asTextList(value, limit).join('；');
+    const content = memories.map(({ memory, index }) => {
+      const number = memory.sourceChapterNumber || index + 1;
+      const lines = [
+        `## 第 ${number} 章《${memory.chapterTitle || '未命名'}》`,
+        `摘要：${memory.summary || '暂无'}`,
+        `人物状态：${list(memory.characterStateChanges) || '暂无'}`,
+        `角色认知：${list(memory.knowledgeChanges) || '暂无'}`,
+        `伏笔：${list(memory.foreshadowingChanges) || '暂无'}`,
+        `时间线：${list(memory.timelineEvents) || '暂无'}`,
+        `设定事实：${list(memory.canonFacts) || '暂无'}`,
+        `冲突：${list(memory.conflicts) || '暂无'}`,
+        `章末钩子：${memory.endingHook || '暂无'}`,
+      ];
+      return lines.join('\n');
+    }).join('\n\n');
+    return { id: 'memory-summary:earlier', kind: '章节快照', title: `前 ${memories.length} 章记忆摘要`, content, updatedAt: 'stable' };
+  };
+
   const findCardRecentMentions = (project: Project, card: KnowledgeCard, limit = 3) => {
     const terms = cardSearchTerms(card);
     const mentions: Array<{ chapter: Chapter; matchedTerm: string; snippet: string; position: number }> = [];
@@ -3613,7 +3775,8 @@ function App() {
     const chapterNodeId = `chapter:${chapter.id}`;
     const chapterNumber = project.chapters.findIndex(item => item.id === chapter.id) + 1;
     const mentionedCards = project.cards.filter(card => cardSearchTerms(card).some(term => chapter.content.includes(term)));
-    const referencedCards = project.cards.filter(card => selectedCardIds.includes(card.id) || mentionedCards.some(item => item.id === card.id));
+    const autoMatchedCards = rankCardsForChapter(project, chapter, '', '', project.memories.find(memory => memory.chapterId === chapter.id));
+    const referencedCards = project.cards.filter(card => selectedCardIds.includes(card.id) || mentionedCards.some(item => item.id === card.id) || autoMatchedCards.some(item => item.id === card.id));
     const graphNodes = [...project.graphNodes];
     const ensureNode = (id: string, label: string, type: KnowledgeGraphNode['type'], category?: string) => {
       const index = graphNodes.findIndex(node => node.id === id);
@@ -3684,6 +3847,20 @@ function App() {
     const edges = normalizeKnowledgeGraphEdges(project.graphEdges);
     const now = new Date().toISOString();
     let cards = project.cards;
+    const cardTypeForEntity = (type?: string): CardType | undefined => {
+      const value = String(type || '').toLocaleLowerCase();
+      if (/人物|角色|主角|配角|character|person/u.test(value)) return '角色卡';
+      if (/地点|场景|城市|区域|location|place/u.test(value)) return '地点卡';
+      if (/势力|组织|宗门|家族|集团|faction|organization/u.test(value)) return '势力卡';
+      if (/物品|道具|装备|artifact|item/u.test(value)) return '物品卡';
+      if (/能力|技能|天赋|系统|金手指|ability|skill/u.test(value)) return '金手指卡';
+      return undefined;
+    };
+    const normalizedCardTitle = (value: string) => value.replace(/[“”"'「」『』【】]/gu, '').replace(/\s+/gu, '').trim().slice(0, 40);
+    const findCardForEntity = (label: string) => {
+      const normalized = normalizedCardTitle(label);
+      return cards.find(card => normalized && (normalized === normalizedCardTitle(card.title) || cardSearchTerms(card).some(term => normalized === normalizedCardTitle(term))));
+    };
     const findNodeId = (label: string) => nodes.find(node => node.label === label)?.id
       || project.cards.find(card => cardSearchTerms(card).includes(label))?.id.toString().replace(/^/, 'card:');
     const ensureEntity = (label: string, category = '实体') => {
@@ -3704,8 +3881,37 @@ function App() {
       if (!nodes.some(node => node.id === `outline:${outline.id}`)) nodes.push({ id: `outline:${outline.id}`, label: outline.title, type: 'outline', category: outline.kind, content: createGraphNodeProfile('outline', outline.kind), updatedAt: now });
     });
     for (const entity of result.entities || []) {
-      const id = ensureEntity(String(entity.name || ''), String(entity.type || '实体'));
+      const label = String(entity.name || '').trim();
+      const category = String(entity.type || '实体').trim() || '实体';
+      const id = ensureEntity(label, category);
       if (!id) continue;
+      // New entities become lightweight, author-confirmable cards immediately.
+      // This prevents later chapter prompts from hallucinating an entity that
+      // was already introduced, without spending another model request.
+      let card = findCardForEntity(label);
+      const cardType = cardTypeForEntity(category);
+      if (!card && cardType) {
+        const createdAt = new Date().toISOString();
+        const nextId = Math.max(0, ...cards.map(item => Number(item.id) || 0)) + 1;
+        card = {
+          id: nextId,
+          type: cardType,
+          title: normalizedCardTitle(label),
+          content: `## 首次发现\n本实体在第 ${project.chapters.findIndex(item => item.id === chapter.id) + 1} 章正文中出现。\n\n## 当前线索\n由章节记忆自动创建，待作者补充确认。`,
+          currentState: '待作者确认',
+          stateHistory: [{ chapterId: chapter.id, chapterTitle: chapter.title, status: '待确认', changes: '由章节记忆自动创建；请作者补充设定。', updatedAt: createdAt }],
+          createdAt,
+          updatedAt: createdAt,
+        };
+        cards = [...cards, card];
+        nodes.push({ id: `card:${card.id}`, label: card.title, type: 'card', category: card.type, content: card.content, status: '待确认', updatedAt: createdAt });
+      }
+      // Keep graph and card identity unified even when the entity already had a card.
+      if (card && !nodes.some(node => node.id === `card:${card.id}`)) nodes.push({ id: `card:${card.id}`, label: card.title, type: 'card', category: card.type, content: card.content, status: card.currentState, updatedAt: card.updatedAt });
+      if (card) {
+        const cardId = `card:${card.id}`;
+        upsertKnowledgeGraphEdge(edges, { id: `${chapterNodeId}->${cardId}:实体卡片`, source: chapterNodeId, target: cardId, label: '实体卡片', weight: 0.9, sourceChapterId: chapter.id, updatedAt: now });
+      }
       const edgeId = `${chapterNodeId}->${id}`;
       upsertKnowledgeGraphEdge(edges, { id: edgeId, source: chapterNodeId, target: id, label: '章节提及', weight: 0.7, sourceChapterId: chapter.id, updatedAt: now });
     }
@@ -3747,14 +3953,15 @@ function App() {
     };
     const currentMemory = editingProject.memories.find(memory => memory.chapterId === chapter.id);
     const localStructuredMemory = buildLocalStructuredMemory(chapter, editingProject);
-    const selectedKeywords = editingProject.cards.filter(card => selectedCardIds.includes(card.id)).map(card => card.title);
+    const autoMatchedCards = rankCardsForChapter(editingProject, chapter, '', getChapterOutline(editingProject, chapter)?.content || '', currentMemory);
+    const selectedKeywords = editingProject.cards.filter(card => selectedCardIds.includes(card.id) || autoMatchedCards.some(item => item.id === card.id)).map(card => card.title);
     const keywords = selectedKeywords.length ? selectedKeywords : (currentMemory?.keywords?.length ? currentMemory.keywords : localStructuredMemory.keywords);
     const localProjectWithMemory = buildProjectWithChapterMemory(editingProject, chapter, {
       ...localStructuredMemory,
       keywords,
     });
     const cardsToRefresh = new Set(localProjectWithMemory.cards
-      .filter(card => selectedCardIds.includes(card.id) || cardSearchTerms(card).some(term => chapter.content.includes(term)))
+      .filter(card => selectedCardIds.includes(card.id) || autoMatchedCards.some(item => item.id === card.id) || cardSearchTerms(card).some(term => chapter.content.includes(term)))
       .map(card => card.id));
     const localProject = refreshCardStatesForProject(localProjectWithMemory, cardsToRefresh);
     const saveProject = async (project: Project) => {
@@ -3803,7 +4010,7 @@ function App() {
             projectTitle: localProject.title,
             chapterTitle: chapter.title,
             content: chapter.content,
-            cards: localProject.cards.filter(card => selectedCardIds.includes(card.id) || (card.title.trim() && chapter.content.includes(card.title))).slice(0, 10),
+            cards: localProject.cards.filter(card => selectedCardIds.includes(card.id) || autoMatchedCards.some(item => item.id === card.id) || (card.title.trim() && chapter.content.includes(card.title))).sort((left, right) => left.id - right.id).slice(0, 10),
             apiKey: agentConfig.apiKey.trim(),
             apiKeys: agentConfig.apiKeys,
             baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
@@ -3853,7 +4060,7 @@ function App() {
           if (!latestProject || !latestChapter || latestChapter.updatedAt !== chapter.updatedAt) return currentProjects;
           const memoryProject = buildProjectWithChapterMemory(latestProject, latestChapter, memoryPatch);
           const refreshedMemoryProject = refreshCardStatesForProject(memoryProject, new Set(memoryProject.cards
-            .filter(card => selectedCardIds.includes(card.id) || cardSearchTerms(card).some(term => latestChapter.content.includes(term)))
+            .filter(card => selectedCardIds.includes(card.id) || autoMatchedCards.some(item => item.id === card.id) || cardSearchTerms(card).some(term => latestChapter.content.includes(term)))
             .map(card => card.id)));
           const mergedBase = mergeKnowledgeGraph(refreshedMemoryProject, latestChapter, result);
           const resultCardIds = (result.cardUpdates || [])
@@ -4149,6 +4356,149 @@ function App() {
     }
   };
 
+  const generateBatchChapters = async (project: Project, requestedCount: number) => {
+    if (batchGenerationRunning) return;
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写可用 API Key，再批量生成章节。' });
+      return;
+    }
+    const count = Math.max(1, Math.min(20, Math.floor(requestedCount)));
+    setBatchGenerationRunning(true);
+    setBatchGenerationProgress(`准备生成 ${count} 章`);
+    setBatchGenerationItems(Array.from({ length: count }, (_, index) => ({
+      chapterNumber: project.chapters.length + index + 1,
+      title: `第 ${project.chapters.length + index + 1} 章`,
+      status: 'pending' as const,
+    })));
+    let working = project;
+    let projectSnapshot = projects;
+    const activeStyle = working.styleProfileId ? writingStyles.find(style => style.id === working.styleProfileId) : undefined;
+    const skillPayload = skills.map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content }));
+    try {
+      await invoke<string>('start_agent_runtime');
+      for (let offset = 0; offset < count; offset += 1) {
+        const previous = working.chapters[working.chapters.length - 1];
+        const chapterNumber = working.chapters.length + 1;
+        const now = new Date().toISOString();
+        const chapterId = Date.now() + offset * 3;
+        const outlineId = chapterId + 1;
+        const chapter: Chapter = { id: chapterId, title: `第 ${chapterNumber} 章`, content: '', wordCount: 0, createdAt: now, updatedAt: now };
+        const updateBatchItem = (patch: Partial<BatchGenerationItem>) => setBatchGenerationItems(current => current.map(item => item.chapterNumber === chapterNumber ? { ...item, ...patch } : item));
+        updateBatchItem({ status: 'outline' });
+        setBatchGenerationProgress(`第 ${chapterNumber} 章：根据第 ${Math.max(1, chapterNumber - 1)} 章正文生成章纲`);
+        const outlineResult = await invoke<{ content?: string }>('call_agent_rpc', {
+          method: 'outline.write',
+          params: {
+            runId: `batch-outline-${chapterId}`,
+            sessionId: `batch-${working.id}`,
+            projectId: String(working.id), projectTitle: working.title, kind: '章纲', outlineId,
+            existingContent: '',
+            instruction: `根据第${chapterNumber - 1}章正文生成第${chapterNumber}章章纲，自动识别并严格承接上一章结尾；最多700字，字数包括标点符号。`,
+            targetChapter: { id: chapter.id, number: chapterNumber, title: chapter.title },
+            sourceChapter: previous ? { id: previous.id, number: chapterNumber - 1, title: previous.title, content: previous.content, mode: '批量生成默认上一章正文' } : undefined,
+            synopsis: working.synopsis,
+            cards: working.cards.slice(0, 10),
+            knowledgeGraph: { nodes: working.graphNodes, edges: working.graphEdges },
+            worldSetting: working.outlines.filter(item => item.kind === '世界观与作品设定').map(item => ({ id: item.id, title: item.title, content: item.content })),
+            writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
+            skills: skillPayload, preferredSkillNames: [],
+            apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+            model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow,
+            ...agentNetworkParams(agentConfig),
+          },
+        });
+        const outlineContent = String(outlineResult.content || '').trim();
+        if (!outlineContent) throw new Error(`第 ${chapterNumber} 章章纲生成为空`);
+        const chapterTitle = batchChapterTitleFromOutline(outlineContent, chapterNumber);
+        const titledChapter = { ...chapter, title: chapterTitle };
+        const outline: OutlineDocument = { id: outlineId, kind: '章纲', chapterId: chapter.id, title: `章纲｜${chapterTitle}`, content: outlineContent, createdAt: now, updatedAt: now };
+        updateBatchItem({ title: chapterTitle, outline: outlineContent, status: 'writing' });
+        const autoCards = rankCardsForChapter(working, titledChapter, '', outlineContent, previous ? working.memories.find(memory => memory.chapterId === previous.id) : undefined);
+        setBatchGenerationProgress(`第 ${chapterNumber} 章：章纲完成，正在生成正文`);
+        const chapterResult = await invoke<{ draftContent?: string; content?: string }>('call_agent_rpc', {
+          method: 'chapter.write',
+          params: {
+            runId: `batch-chapter-${chapterId}`, sessionId: `batch-${working.id}`,
+            projectId: String(working.id), projectTitle: working.title, chapterId: String(titledChapter.id),
+            instruction: '严格按照本章章纲生成正文，正文最多 2200 字（包含标点符号、空格和换行），自然承接上一章结尾。只输出正文，不要输出 JSON、计划、标题或解释。',
+            outline: outlineContent, outlines: [
+              ...working.outlines.filter(item => item.kind === '世界观与作品设定').map(item => ({ id: item.id, kind: item.kind, title: item.title, content: item.content })),
+              { id: outline.id, kind: outline.kind, title: outline.title, chapterId: outline.chapterId, content: outline.content },
+            ], activeOutlineId: outline.id,
+            cards: [...autoCards, ...working.cards.filter(card => !autoCards.some(item => item.id === card.id))].slice(0, 10),
+            knowledgeGraph: { nodes: working.graphNodes, edges: working.graphEdges },
+            previousChapters: previous ? [{ id: previous.id, title: previous.title, content: previous.content }] : [],
+            memories: previous ? working.memories.filter(memory => memory.chapterId === previous.id).map(memory => ({ id: memory.id, title: memory.chapterTitle, summary: memory.summary, keywords: memory.keywords, characterStateChanges: memory.characterStateChanges, knowledgeChanges: memory.knowledgeChanges, foreshadowingChanges: memory.foreshadowingChanges, timelineEvents: memory.timelineEvents, canonFacts: memory.canonFacts, conflicts: memory.conflicts, endingHook: memory.endingHook })) : [],
+            memoryDocuments: [], writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
+            skills: skillPayload, preferredSkillNames: [], authorPreferences: working.authorPreferences || [],
+            apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+            model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow,
+            ...agentNetworkParams(agentConfig),
+          },
+        });
+        const content = clampChapterContent(chapterDraftFromStream(String(chapterResult.draftContent || chapterResult.content || '')), 2200);
+        if (!content) throw new Error(`第 ${chapterNumber} 章正文生成为空`);
+        const completedChapter = { ...titledChapter, content, wordCount: countNovelCharacters(content), updatedAt: new Date().toISOString() };
+        updateBatchItem({ content, status: 'memory' });
+        setBatchGenerationProgress(`第 ${chapterNumber} 章：正文完成（${completedChapter.wordCount} 字），正在更新记忆`);
+        const localMemory = buildLocalStructuredMemory(completedChapter, working);
+        let memoryPatch: Partial<ChapterMemory> = localMemory;
+        try {
+          const memoryResult = await invoke<AgentMemoryResult>('call_agent_rpc', {
+            method: 'memory.write',
+            params: {
+              projectTitle: working.title,
+              chapterTitle: completedChapter.title,
+              content: completedChapter.content,
+              cards: [...autoCards, ...working.cards.filter(card => !autoCards.some(item => item.id === card.id))].slice(0, 10),
+              apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys,
+              baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+              model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode,
+              reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow,
+              knowledgeGraph: { nodes: working.graphNodes, edges: working.graphEdges },
+              ...agentNetworkParams(agentConfig),
+            },
+          });
+          const listOrFallback = (value: unknown, fallback: string[], limit = 30) => {
+            const values = asTextList(value, limit);
+            return values.length ? values : fallback;
+          };
+          memoryPatch = {
+            ...localMemory,
+            summary: typeof memoryResult.summary === 'string' && memoryResult.summary.trim() ? memoryResult.summary.trim() : localMemory.summary,
+            keywords: listOrFallback(memoryResult.keywords, localMemory.keywords, 8),
+            characterStateChanges: listOrFallback(memoryResult.characterStateChanges, localMemory.characterStateChanges),
+            knowledgeChanges: listOrFallback(memoryResult.knowledgeChanges, localMemory.knowledgeChanges),
+            foreshadowingChanges: listOrFallback(memoryResult.foreshadowingChanges, localMemory.foreshadowingChanges),
+            foreshadowingItems: Array.isArray(memoryResult.foreshadowingItems) ? memoryResult.foreshadowingItems : [],
+            timelineEvents: listOrFallback(memoryResult.timelineEvents, localMemory.timelineEvents),
+            canonFacts: listOrFallback(memoryResult.canonFacts, localMemory.canonFacts),
+            conflicts: listOrFallback(memoryResult.conflicts, localMemory.conflicts),
+            endingHook: typeof memoryResult.endingHook === 'string' && memoryResult.endingHook.trim() ? memoryResult.endingHook.trim() : localMemory.endingHook,
+          };
+        } catch {
+          // Local extraction still persists a usable memory when the memory request is slow or unavailable.
+        }
+        const chapterAdded: Project = { ...working, chapters: [...working.chapters, completedChapter], outlines: [...working.outlines, outline], wordCount: working.wordCount + completedChapter.wordCount, updatedAt: new Date().toISOString() };
+        const next = buildProjectWithChapterMemory(chapterAdded, completedChapter, memoryPatch);
+        updateBatchItem({ status: 'complete', memory: memoryPatch.summary || localMemory.summary });
+        working = next;
+        projectSnapshot = projectSnapshot.map(item => item.id === next.id ? next : item);
+        setProjects(projectSnapshot);
+        if (editingProject?.id === next.id) setEditingProject(next);
+        if ('__TAURI_INTERNALS__' in window) await invoke<string>('save_projects', { projects: projectSnapshot });
+        else localStorage.setItem('projects', JSON.stringify(projectSnapshot));
+      }
+      setNotice({ title: '批量生成完成', content: `已连续生成 ${count} 章章纲和正文。` });
+    } catch (error) {
+      setBatchGenerationItems(current => current.map(item => item.status === 'outline' || item.status === 'writing' || item.status === 'memory' ? { ...item, status: 'error' } : item));
+      setNotice({ title: '批量生成中断', content: `${String(error)}；已保留此前完成的章节。` });
+    } finally {
+      setBatchGenerationRunning(false);
+      setBatchGenerationProgress('');
+    }
+  };
+
   const startNewCard = () => {
     setActiveCardId(null);
     setCardDraft({ type: '角色卡', title: '', content: '' });
@@ -4309,6 +4659,11 @@ function App() {
     const currentChapterOutline = selectedChapterOutlines.find(outline => String(outline.chapterId ?? '') === String(activeChapter.id)) || selectedChapterOutlines[0];
     const selectedOutlines = editingProject.outlines.filter(outline => outline.kind === '世界观与作品设定' || selectedOutlineIds.includes(outline.id));
     const previousMemory = continuityChapter ? editingProject.memories.find(memory => memory.chapterId === continuityChapter.id) : undefined;
+    const autoMatchedCards = rankCardsForChapter(editingProject, activeChapter, agentInstruction, selectedChapterOutlines.map(outline => outline.content).join('\n'), previousMemory);
+    const resolvedCardIds = Array.from(new Set([...selectedCardIds, ...autoMatchedCards.map(card => card.id)]));
+    const earlierMemorySummary = buildEarlierMemorySummary(editingProject, activeChapter, agentConfig.memorySummaryChapterCount);
+    // Reflect automatic matches in the picker without making them mandatory.
+    if (resolvedCardIds.some(id => !selectedCardIds.includes(id))) setSelectedCardIds(resolvedCardIds);
     try {
       await invoke<string>('start_agent_runtime');
       setAgentProgress(items => items.map(item => item.id === 'starting'
@@ -4329,12 +4684,12 @@ function App() {
           outlines: selectedOutlines.map(outline => ({ id: outline.id, kind: outline.kind, title: outline.title, chapterId: outline.chapterId, content: outline.content })),
           activeOutlineId: currentChapterOutline?.id,
           outline: selectedOutlineIds.includes(currentChapterOutline?.id ?? -1) ? currentChapterOutline?.content || '' : '',
-          cards: editingProject.cards.filter(card => selectedCardIds.includes(card.id)),
+          cards: editingProject.cards.filter(card => resolvedCardIds.includes(card.id)).sort((left, right) => left.id - right.id).slice(0, 10),
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
           skills: [...agentSkills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])]
             .map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
           preferredSkillNames: prioritizedSkillNames,
-          // 章节承接只传入紧邻上一章正文；更早章节只通过用户勾选的结构化记忆进入。
+          // 章节承接只传入紧邻上一章正文；更早章节合并成一个稳定摘要，避免正文膨胀。
           previousChapters: continuityChapter ? [{ id: continuityChapter.id, title: continuityChapter.title, content: continuityChapter.content }] : [],
           memories: (previousMemory ? [previousMemory] : []).map(memory => ({
             id: memory.id,
@@ -4349,7 +4704,7 @@ function App() {
             conflicts: memory.conflicts,
             endingHook: memory.endingHook,
           })),
-          memoryDocuments: [],
+          memoryDocuments: earlierMemorySummary ? [earlierMemorySummary] : [],
           apiKey: agentConfig.apiKey.trim(),
           apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim(),
@@ -5335,6 +5690,19 @@ function App() {
                   AI 检测
                 </button>
               </div>
+              <div className="batch-generation-sidebar-entry">
+                <button
+                  type="button"
+                  className="btn-primary"
+                  onClick={() => {
+                    setBatchGenerationCount('3');
+                    setBatchGenerationProjectId(editingProject.id);
+                    setShowBatchGenerationModal(true);
+                  }}
+                >
+                  一键生成章节
+                </button>
+              </div>
 
               {editorSidebarTab === 'ai-detect' && (() => {
                 const report = editingProject.aiDetection;
@@ -5386,6 +5754,17 @@ function App() {
                             handleOpenChapterLocation(chapter);
                           }}
                         >打开位置</button>
+                        <button
+                          className="chapter-delete-button"
+                          title={`删除${chapter.title}`}
+                          aria-label={`删除${chapter.title}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setChapterPendingDeletion(chapter);
+                          }}
+                        >
+                          删除
+                        </button>
                       </div>
                     ))}
                   </div>
@@ -5808,8 +6187,8 @@ function App() {
                     <p className="empty-hint compact">世界观与作品设定固定自动带入；总纲不会传入章节智能体。</p>
                   </div>
                   <div className="agent-card-picker">
-                    <div className="agent-card-picker-title">本章带入卡片 <small>{selectedCardIds.length} 张</small></div>
-                    <button type="button" className={`agent-context-select ${showChapterCardPicker ? 'active' : ''}`} onClick={() => setShowChapterCardPicker(current => !current)}>选择卡片</button>
+                    <div className="agent-card-picker-title">本章自动带入卡片 <small>{selectedCardIds.length} 张，可手动追加</small></div>
+                    <button type="button" className={`agent-context-select ${showChapterCardPicker ? 'active' : ''}`} onClick={() => setShowChapterCardPicker(current => !current)}>查看 / 追加卡片</button>
                     {showChapterCardPicker && <div className="agent-context-dropdown">{editingProject.cards.length === 0 ? <p className="empty-hint compact">先在卡片页创建知识卡</p> : editingProject.cards.map(card => <label key={card.id} className="agent-card-option"><input type="checkbox" checked={selectedCardIds.includes(card.id)} onChange={() => toggleCardForChapter(card.id)} /><span><strong>{card.title}</strong><small>{card.type}</small></span></label>)}</div>}
                   </div>
                   <div className="agent-memory-picker">
@@ -6099,6 +6478,7 @@ function App() {
             <div className="settings-layout">
               <nav className="settings-sidebar" aria-label="设置分类">
                 <button className={settingsSection === 'model' ? 'active' : ''} onClick={() => setSettingsSection('model')}><strong>AI 模型配置</strong><small>服务、接口、密钥与模型参数</small></button>
+                <button className={settingsSection === 'writing' ? 'active' : ''} onClick={() => setSettingsSection('writing')}><strong>写作设置</strong><small>章节记忆与自动检索范围</small></button>
                 <button className={settingsSection === 'network' ? 'active' : ''} onClick={() => setSettingsSection('network')}><strong>网络设置</strong><small>代理连接与本地地址规则</small></button>
                 <button className={settingsSection === 'usage' ? 'active' : ''} onClick={() => setSettingsSection('usage')}><strong>API 用量</strong><small>余额、模型价格与个人日志</small></button>
                 <button className={settingsSection === 'sync' ? 'active' : ''} onClick={() => setSettingsSection('sync')}><strong>备份与同步</strong><small>百度网盘云端备份与恢复</small></button>
@@ -6168,6 +6548,15 @@ function App() {
                 </div>}
               </section>
               </>}
+              {settingsSection === 'writing' && <section className="settings-network-card settings-network-panel">
+                <div className="settings-network-header"><div><strong>章节写作上下文</strong><small>上一章始终自动带入，更早章节压缩为一份摘要</small></div><span className="settings-sync-badge">省 Token</span></div>
+                <div className="form-group">
+                  <label>前章记忆摘要数量 <strong>{settingsDraft.memorySummaryChapterCount} 章</strong></label>
+                  <input className="settings-range" type="range" min="0" max="20" step="1" value={settingsDraft.memorySummaryChapterCount} onChange={event => setSettingsDraft({ ...settingsDraft, memorySummaryChapterCount: Number(event.target.value) })} />
+                  <small className="settings-network-note">读取上一章之前的最近 N 章结构化记忆并合并为一个稳定摘要。设为 0 表示关闭；不会加载更早章节正文。</small>
+                </div>
+                <div className="settings-context-preview"><span>固定上下文顺序</span><strong>世界观与作品设定 → 文风与技能 → 上一章正文/记忆 → 前章摘要 → 当前章纲与指令</strong></div>
+              </section>}
               {settingsSection === 'network' && <section className="settings-network-card settings-network-panel">
                 <div className="settings-network-header"><div><strong>网络设置</strong><small>为模型请求配置代理连接</small></div><label className="settings-toggle" title="启用网络代理"><input type="checkbox" checked={settingsDraft.proxyEnabled} onChange={(event) => setSettingsDraft({ ...settingsDraft, proxyEnabled: event.target.checked })} /><span /></label></div>
                 <div className="settings-network-address"><input className="input" value={settingsDraft.proxyURL} disabled={!settingsDraft.proxyEnabled} placeholder="http://127.0.0.1:7897" onChange={(event) => setSettingsDraft({ ...settingsDraft, proxyURL: event.target.value })} /><button className="btn-secondary" onClick={useSystemProxy}>读取系统代理</button></div>
@@ -6422,6 +6811,30 @@ function App() {
         </div>
       )}
 
+      {batchGenerationRunning && !showBatchGenerationModal && (
+        <button type="button" className="batch-background-progress" onClick={() => setShowBatchGenerationModal(true)}>
+          <span><strong>连续生成章节</strong><small>{batchGenerationProgress || '正在后台生成...'}</small></span>
+          <b>查看进度</b>
+        </button>
+      )}
+
+      {showBatchGenerationModal && batchGenerationProjectId !== null && (() => {
+        const target = projects.find(item => item.id === batchGenerationProjectId);
+        if (!target) return null;
+        return <div className="modal-overlay" onClick={() => setShowBatchGenerationModal(false)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="batch-generation-title" onClick={event => event.stopPropagation()}>
+            <div className="modal-header"><h3 id="batch-generation-title">一键生成章节</h3><button className="modal-close" aria-label={batchGenerationRunning ? '转入后台运行' : '关闭'} onClick={() => setShowBatchGenerationModal(false)}>×</button></div>
+            <div className="modal-body">
+              <p>《{target.title}》将从第 {target.chapters.length + 1} 章开始，逐章生成章纲和正文。每章自动读取上一章正文，章纲默认不超过 700 字（含标点）。</p>
+              <label className="form-group"><span>生成章数</span><input className="input" type="number" min="1" max="20" step="1" value={batchGenerationCount} disabled={batchGenerationRunning} onChange={event => setBatchGenerationCount(event.target.value)} /></label>
+              {batchGenerationRunning && <p className="settings-network-note">{batchGenerationProgress || '正在生成...'}</p>}
+              {batchGenerationItems.length > 0 && <div className="batch-generation-items" aria-live="polite">{batchGenerationItems.map(item => <article key={item.chapterNumber} className={`batch-generation-item ${item.status}`}><div className="batch-generation-item-heading"><strong>{item.title}</strong><span>{item.status === 'pending' ? '等待' : item.status === 'outline' ? '生成章纲' : item.status === 'writing' ? '生成正文' : item.status === 'memory' ? '更新记忆' : item.status === 'complete' ? '已完成' : '失败'}</span></div>{item.outline && <details><summary>查看章纲</summary><pre>{item.outline}</pre></details>}{item.content && <details open={item.status === 'complete'}><summary>查看正文 · {countNovelCharacters(item.content)} 字</summary><pre>{item.content}</pre></details>}{item.memory && <small className="batch-generation-memory">记忆：{item.memory}</small>}</article>)}</div>}
+            </div>
+            <div className="modal-footer"><button className="btn-secondary" onClick={() => setShowBatchGenerationModal(false)}>{batchGenerationRunning ? '后台运行' : '关闭'}</button><button className="btn-primary" disabled={batchGenerationRunning} onClick={() => void generateBatchChapters(target, Number(batchGenerationCount) || 1)}>{batchGenerationRunning ? '生成中...' : batchGenerationItems.length ? '重新生成' : '开始生成'}</button></div>
+          </div>
+        </div>;
+      })()}
+
       {showTagPicker && (
         <div className="modal-overlay tag-picker-overlay" onClick={() => setShowTagPicker(false)}>
           <div className="modal work-tags-modal" role="dialog" aria-modal="true" aria-labelledby="work-tags-title" onClick={(event) => event.stopPropagation()}>
@@ -6473,6 +6886,25 @@ function App() {
             <div className="modal-footer">
               <button className="btn-secondary" onClick={() => setProjectPendingDeletion(null)}>取消</button>
               <button className="btn-danger" onClick={handleDeleteProject}>确认删除</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {chapterPendingDeletion && (
+        <div className="modal-overlay" onClick={() => setChapterPendingDeletion(null)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="delete-chapter-title" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3 id="delete-chapter-title">删除章节</h3>
+              <button className="modal-close" aria-label="关闭" onClick={() => setChapterPendingDeletion(null)}>×</button>
+            </div>
+            <div className="modal-body">
+              <p>确定删除《{chapterPendingDeletion.title}》吗？</p>
+              <p className="delete-warning">本章正文、绑定章纲、章节记忆、图谱关系和 AI 检测记录都会被移除，此操作不可撤销。</p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setChapterPendingDeletion(null)}>取消</button>
+              <button className="btn-danger" onClick={() => void handleDeleteChapter()}>确认删除</button>
             </div>
           </div>
         </div>

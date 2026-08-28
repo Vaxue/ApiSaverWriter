@@ -428,7 +428,12 @@ export function prepareChapterInput(input: {
   const memoryDocuments = Array.isArray(input.memoryDocuments)
     ? input.memoryDocuments.filter(item => item && typeof item === "object").slice(0, 4).map(item => {
       const document = item as Record<string, unknown>;
-      return { kind: compactText(document.kind || "记忆文档", 80), title: compactText(document.title || "", 100), content: compactText(document.content || "", 900) };
+      const title = compactText(document.title || "", 100);
+      // Earlier-chapter memory is already a single deterministic, compact
+      // document. Preserve enough of it to be useful while keeping ordinary
+      // editable memory documents at the smaller budget.
+      const contentLimit = /前\s*\d+\s*章.*摘要|memory-summary/iu.test(`${title} ${String(document.id || "")}`) ? 4500 : 900;
+      return { kind: compactText(document.kind || "记忆文档", 80), title, content: compactText(document.content || "", contentLimit) };
     })
     : [];
   const sections = {

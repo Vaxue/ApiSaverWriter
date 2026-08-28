@@ -206,6 +206,7 @@ export const ChapterState = Annotation.Root({
   writingStyle: Annotation<{ name: string; content: string } | undefined>,
   outline: Annotation<string | undefined>,
   previousChapters: Annotation<Array<{ id?: string | number; title: string; content: string }> | undefined>,
+  earlierMemorySummary: Annotation<string | undefined>,
   knowledgeGraph: Annotation<string | undefined>,
   cards: Annotation<Array<{ type?: string; title: string; content: string }> | undefined>,
   skillCatalog: Annotation<SkillDefinition[]>({ reducer: (_prev, next) => next, default: () => [] }),
@@ -385,6 +386,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const planPrompt = [
         state.outline ? "## 章节细纲\n" + compactText(state.outline, 1800) : "",
         state.continuityContext ? "## 上一章承接（最高优先级）\n" + compactText(state.continuityContext, 3200) : "",
+        state.earlierMemorySummary ? "## 更早章节压缩摘要（仅作连续性参考）\n" + compactText(state.earlierMemorySummary, 4200) : "",
         state.retrievedContext.length ? "## 结构化记忆\n" + compactText(state.retrievedContext.join("\n\n"), 2600) : "",
         state.knowledgeGraph ? "## 相关知识图谱\n" + compactText(state.knowledgeGraph, 1800) : "",
         skillSection ? "## 执行技能\n" + skillSection : "",
@@ -434,6 +436,9 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const continuitySection = state.continuityContext
         ? `\n## 章节承接（最高优先级）\n${state.continuityContext}\n`
         : "";
+      const earlierMemorySection = state.earlierMemorySummary
+        ? `\n## 更早章节压缩摘要（只用于补足连续性，不得覆盖上一章）\n${compactText(state.earlierMemorySummary, 4200)}\n`
+        : "";
       const planSection = state.chapterPlan ? `\n## 下一章计划（必须执行）\n${state.chapterPlan}\n` : "";
       // Keep project facts first and byte-stable; only the dynamic turn changes after it.
       const stablePacket = stableProjectPacket(state);
@@ -443,7 +448,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const mutableProjectContext = [skillsSection, outlineSection, cardsSection, graphSection].filter(Boolean).join("");
       // Keep the stable project facts first, then the durable session handoff;
       // chapter-specific material follows so upstream prefix caches remain stable.
-      const dynamicPacket = [mutableProjectContext, continuitySection, planSection, contextSection].filter(Boolean).join("");
+      const dynamicPacket = [mutableProjectContext, continuitySection, earlierMemorySection, planSection, contextSection].filter(Boolean).join("");
       emitter?.context("draft", "组装稳定设定与动态上下文", { source: "ContextAssembler", status: "loaded", bytes: byteLength(dynamicPacket), items: state.selectedSkills.length + (state.cards?.length || 0) });
       const hasPreviousChapter = Boolean(state.previousChapters?.some(chapter => chapter?.content?.trim()));
       const continuityInstruction = hasPreviousChapter
@@ -497,8 +502,11 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const graphSection = state.knowledgeGraph
         ? `\n## 知识图谱约束\n${state.knowledgeGraph}\n`
         : "";
+      const earlierMemorySection = state.earlierMemorySummary
+        ? `\n## 更早章节压缩摘要\n${compactText(state.earlierMemorySummary, 4200)}\n`
+        : "";
 
-      const reviewConstraints = `${cardsSection}${graphSection}${contextSection}`;
+      const reviewConstraints = `${cardsSection}${graphSection}${earlierMemorySection}${contextSection}`;
       const reviewDraft = compactText(state.draftContent, 10000);
       const reviewPrompt = `## 约束摘要\n${reviewConstraints || "（暂无额外约束）"}\n\n## 待审查章节\n${reviewDraft}`;
       const stablePacket = stableProjectPacket(state);

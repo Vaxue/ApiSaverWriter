@@ -47,6 +47,19 @@ const cardSessionCache = new LruCache<AgentSessionState>(96);
 
 const SESSION_KEEP_TURNS = 2;
 
+// Local saves refresh timestamps on chapters, cards and graph edges. Those
+// timestamps are not prompt facts, so omit them from the preparation key or a
+// save-without-content-change would defeat the persistent context cache.
+function cacheStableContext(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(cacheStableContext);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => key !== "updatedAt" && key !== "createdAt")
+      .map(([key, child]) => [key, cacheStableContext(child)]));
+  }
+  return value;
+}
+
 function normalizeAgentSession(value: unknown): AgentSessionState {
   if (typeof value === "string") {
     return { version: 1, summary: compactText(value, 5000), recentTurns: [] };
@@ -190,7 +203,7 @@ const chapterOutlineOutputProtocol = `## 番茄小说章纲生成器输出协议
 ## 章末钩子
 必须落在具体动作、对话或画面上，形成追读钩子；不得写“欲知后事如何”。
 
-硬性限制：不设固定字数上限，必须优先完整输出所有必要场景、人物功能、信息伏笔、爽点拆解与章末钩子；不得因长度裁剪或半途结束。只输出 Markdown 章纲正文，不输出技能名、知识图谱、实体关系、JSON、分析过程、前言或后记。未知信息写“待揭示”，不得虚构。`;
+硬性限制：默认控制在 700 字以内，字数统计包括汉字、数字、空格、换行和所有标点符号；先保证承接事实、核心冲突、转折、释放点和章末钩子，再压缩非关键修饰。只有作者明确要求更长时才放宽，不得半途截断。只输出 Markdown 章纲正文，不输出技能名、知识图谱、实体关系、JSON、分析过程、前言或后记。未知信息写“待揭示”，不得虚构。`;
 
 function normalizeChapterOutlineOutput(value: string): string {
   let content = String(value || "").trim()
@@ -1562,7 +1575,10 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
       );
       const memoryCacheKey = stableHash({
         projectTitle: String(projectTitle || ""), chapterTitle: String(chapterTitle), content: String(content),
-        cards: relevantCards.map(card => ({ id: card.id, title: card.title, state: card.currentState, updatedAt: card.updatedAt })),
+        // updatedAt changes on every local save even when the chapter and card
+        // facts are unchanged. Excluding it lets identical memory writes reuse
+        // the persistent cache after restart.
+        cards: relevantCards.map(card => ({ id: card.id, title: card.title, state: card.currentState, content: card.content })),
         graphSummary, model: String(model || "gpt-5.5"), apiMode: String(apiMode || "openai"),
       });
       const cachedMemory = chapterMemoryCache.get(memoryCacheKey) || await readPersistentContext<Record<string, unknown>>(`memory-${memoryCacheKey}`);
@@ -2131,7 +2147,10 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
       const formatSection = formatOutlineRecord
         ? `## 格式参考章纲（仅参考表达密度，不得覆盖固定输出协议）\n参考模式：${compactText(formatOutlineRecord.mode || "上一章章纲格式", 100)}\n${compactText(formatOutlineRecord.title || "参考章纲", 120)}\n${compactText(formatOutlineRecord.content || "", 9000)}\n\n硬性要求：固定输出协议的栏目、顺序和字段名优先；只能参考这份章纲的详略和语气，不得照抄其人物、事件、数字、旧栏目或结尾。`
         : `## 格式要求\n没有可用的参考章纲，请严格使用“小说章纲生成器”技能定义的固定模板。`;
-      const dynamicTask = `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。章纲必须严格逐项填写固定输出协议，不能使用旧的“核心主线与目标”“核心冲突与节奏”“分段剧情梗概”“实体与关系更新”等替代栏目。旧草稿若与唯一正文依据或章节交接状态冲突，必须完全丢弃冲突部分并重写。若作者指令与历史会话冲突，以本次目标章、唯一正文依据、固定输出协议和作者指令为准。不要输出分析过程、格式说明或额外前言。`;
+      const chapterLengthRule = kind === "章纲"
+        ? "默认输出不超过700字（包括汉字、数字、空格、换行和标点符号）；压缩表达但不得丢失承接事实、冲突转折、释放点和章末钩子。"
+        : "";
+      const dynamicTask = `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "根据上一章正文生成下一章章纲", 1800)}\n${chapterLengthRule}\n\n${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。章纲必须严格逐项填写固定输出协议，不能使用旧的“核心主线与目标”“核心冲突与节奏”“分段剧情梗概”“实体与关系更新”等替代栏目。旧草稿若与唯一正文依据或章节交接状态冲突，必须完全丢弃冲突部分并重写。若作者指令与历史会话冲突，以本次目标章、唯一正文依据、固定输出协议和作者指令为准。不要输出分析过程、格式说明或额外前言。`;
       emitter.progress("plan", 48, isNextChapterHandoff ? "步骤 3/5：根据交接状态规划本章事件链与冲突升级" : sourceChapterNumber === targetChapterNumber ? "步骤 3/5：从本章正文提取事件链、冲突与伏笔" : "步骤 3/5：校验指定正文与目标章的事实边界");
       emitter.context("plan", isNextChapterHandoff ? "正在校验上一章结束状态，阻止重复事件" : sourceChapterNumber === targetChapterNumber ? "正在从本章正文提取已发生事件，避免虚构后续" : "正在校验指定正文与目标章的事实边界", { source: isNextChapterHandoff ? "章纲承接规范" : "正文事实校验", status: "loaded", bytes: byteLength(sourceHandoff), items: sourceChapterRecord ? 1 : 0 });
       emitter.progress("draft", 62, "步骤 4/5：调用模型生成章纲正文");
@@ -2143,7 +2162,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         // Keep the current target/source packet last so stale session turns
         // cannot override the chapter the author just selected.
         { role: "user", content: dynamicTask },
-      ], { max_tokens: kind === "章纲" ? 5000 : 3000, temperature: 0.45, retryAttempts: 2 }, chunk => emitter.chunk(chunk));
+      ], { max_tokens: kind === "章纲" ? 1800 : 3000, temperature: 0.45, retryAttempts: 2 }, chunk => emitter.chunk(chunk));
       emitter.progress("review", 92, "步骤 5/5：校验章节承接、格式与章末钩子");
       emitter.complete("大纲内容生成完成");
       const nextOutlineSession = appendAgentSession(outlineSession, String(instruction || "补全结构并强化可执行性"), response.content, contextWindow, byteLength(stableProjectPacket));
@@ -2190,11 +2209,11 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event }) + "\n");
       });
       streamEmitter.progress("starting", 3, "运行环境已就绪，正在整理本章资料");
-      const preparationKey = stableHash({
+      const preparationKey = stableHash(cacheStableContext({
         projectId, chapterId, instruction, outline, outlines, activeOutlineId, cards,
         previousChapters, memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills, preferredSkillNames,
         contextWindow: Number(contextWindow) || 128,
-      });
+      }));
       const cachedPreparation = chapterPreparationCache.get(preparationKey)
         || await readPersistentContext<PreparedChapterInput>(`chapter-prep-${preparationKey}`);
       const prepared = cachedPreparation || prepareChapterInput({
@@ -2306,6 +2325,8 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
           ...networkProxyConfig(req.params),
           streamEmitter,
         });
+        const earlierMemorySummary = prepared.memoryDocuments
+          .find(document => /前\s*\d+\s*章.*摘要|memory-summary/iu.test(`${String(document.title || "")} ${String(document.id || "")}`));
         const result = await graph.invoke({
           projectId: normalizedProjectId,
           chapterId: String(chapterId),
@@ -2314,6 +2335,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
           writingStyle: writingStyle && typeof writingStyle === "object" ? { name: String((writingStyle as Record<string, unknown>).name || "绑定文风"), content: compactText((writingStyle as Record<string, unknown>).content || "", 3000) } : undefined,
           outline: prepared.outline,
           previousChapters: prepared.previousChapters,
+          earlierMemorySummary: earlierMemorySummary ? String(earlierMemorySummary.content || "") : undefined,
           knowledgeGraph: prepared.knowledgeGraph,
           cards: prepared.cards,
           skillCatalog: prepared.skills,
