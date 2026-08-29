@@ -493,12 +493,31 @@ const chapterDraftFromStream = (raw: string, depth = 0): string => {
     : value;
 };
 
-const batchChapterTitleFromOutline = (raw: string, chapterNumber: number): string => {
+const batchChapterTitleFromOutline = (raw: string, chapterNumber: number, preferredTitle?: string): string => {
+  const chapterDigits = '\\d+|[零〇一二三四五六七八九十百千]+';
+  const cleanTitle = (value: string) => value
+    .replace(new RegExp(`^第\\s*(?:${chapterDigits})\\s*章\\s*[：:、-]?\\s*`, 'u'), '')
+    .replace(/^章纲\s*[|｜:：-]\s*/u, '')
+    .replace(/^(?:章节标题|标题)\s*[：:]?/u, '')
+    .replace(/^《(.+?)》$/u, '$1')
+    .trim();
+  const preferred = cleanTitle(String(preferredTitle || '').trim());
+  if (preferred && !/^(?:正文|内容|未命名|未命名章节|章节)$/u.test(preferred)) return `第 ${chapterNumber} 章 ${preferred}`;
   const text = chapterDraftFromStream(raw).replace(/```(?:markdown|text)?/giu, '').trim();
-  const heading = text.split(/\r?\n/u).map(line => line.trim()).find(line => /^#{1,6}\s*\S/u.test(line));
-  const candidate = (heading || '').replace(/^#{1,6}\s*/u, '').trim()
-    .replace(/^章纲\s*[|｜:：-]\s*/u, '').trim();
-  if (!candidate) return `第 ${chapterNumber} 章`;
+  const lines = text.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+  const heading = lines.find(line => new RegExp(`^#{1,6}\\s*(?:章纲\\s*[|｜:：-]\\s*)?第\\s*(?:${chapterDigits})\\s*章`, 'u').test(line))
+    || lines.find(line => /^#{1,6}\s*章纲/u.test(line));
+  const labelIndex = lines.findIndex(line => /^(?:章节标题|标题)\s*[：:]/u.test(line));
+  const labeled = labelIndex >= 0 ? lines[labelIndex] : '';
+  const labeledValue = labeled.replace(/^(?:章节标题|标题)\s*[：:]\s*/u, '').trim() || (labelIndex >= 0 ? lines[labelIndex + 1] || '' : '');
+  const candidate = cleanTitle((heading || labeledValue || '').replace(/^#{1,6}\s*/u, '').trim());
+  if (!candidate) {
+    const summaryIndex = lines.findIndex(line => /^(?:核心主线与目标|本章目标|章节定位|核心事件)(?:\s*[：:].*)?$/u.test(line.replace(/^#{1,6}\s*/u, '')));
+    const summaryLine = summaryIndex >= 0 ? (lines[summaryIndex].match(/[：:]\s*(.+)$/u)?.[1] || lines[summaryIndex + 1] || '') : '';
+    const summary = summaryLine.replace(/^[-*]\s*/u, '').replace(/[。！？.!?].*$/u, '').trim();
+    if (summary && !/^(?:暂无|无|待定|待揭示)$/u.test(summary)) return `第 ${chapterNumber} 章 ${Array.from(summary).slice(0, 24).join('')}`;
+    return `第 ${chapterNumber} 章`;
+  }
   const numbered = candidate.match(/^第\s*\d+\s*章(?:\s+|[：:、-])?(.*)$/u);
   if (numbered) return `第 ${chapterNumber} 章${numbered[1]?.trim() ? ` ${numbered[1].trim()}` : ''}`;
   return `第 ${chapterNumber} 章 ${candidate}`.trim();
@@ -4386,7 +4405,7 @@ function App() {
         const updateBatchItem = (patch: Partial<BatchGenerationItem>) => setBatchGenerationItems(current => current.map(item => item.chapterNumber === chapterNumber ? { ...item, ...patch } : item));
         updateBatchItem({ status: 'outline' });
         setBatchGenerationProgress(`第 ${chapterNumber} 章：根据第 ${Math.max(1, chapterNumber - 1)} 章正文生成章纲`);
-        const outlineResult = await invoke<{ content?: string }>('call_agent_rpc', {
+        const outlineResult = await invoke<{ title?: string; content?: string }>('call_agent_rpc', {
           method: 'outline.write',
           params: {
             runId: `batch-outline-${chapterId}`,
@@ -4409,7 +4428,7 @@ function App() {
         });
         const outlineContent = String(outlineResult.content || '').trim();
         if (!outlineContent) throw new Error(`第 ${chapterNumber} 章章纲生成为空`);
-        const chapterTitle = batchChapterTitleFromOutline(outlineContent, chapterNumber);
+        const chapterTitle = batchChapterTitleFromOutline(outlineContent, chapterNumber, outlineResult.title);
         const titledChapter = { ...chapter, title: chapterTitle };
         const outline: OutlineDocument = { id: outlineId, kind: '章纲', chapterId: chapter.id, title: `章纲｜${chapterTitle}`, content: outlineContent, createdAt: now, updatedAt: now };
         updateBatchItem({ title: chapterTitle, outline: outlineContent, status: 'writing' });

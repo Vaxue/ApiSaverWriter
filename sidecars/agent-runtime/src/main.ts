@@ -205,11 +205,60 @@ const chapterOutlineOutputProtocol = `## 番茄小说章纲生成器输出协议
 
 硬性限制：默认控制在 700 字以内，字数统计包括汉字、数字、空格、换行和所有标点符号；先保证承接事实、核心冲突、转折、释放点和章末钩子，再压缩非关键修饰。只有作者明确要求更长时才放宽，不得半途截断。只输出 Markdown 章纲正文，不输出技能名、知识图谱、实体关系、JSON、分析过程、前言或后记。未知信息写“待揭示”，不得虚构。`;
 
-function normalizeChapterOutlineOutput(value: string): string {
+function unwrapOutlineEnvelope(value: string): { title?: string; content: string } {
   let content = String(value || "").trim()
-    .replace(/^```(?:markdown|md|text)?\s*/iu, "")
+    .replace(/^```(?:json|markdown|md|text)?\s*/iu, "")
     .replace(/```$/u, "")
     .trim();
+  try {
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    const nested = typeof parsed.content === "string" ? parsed.content : typeof parsed.body === "string" ? parsed.body : "";
+    if (nested.trim()) {
+      return {
+        title: typeof parsed.title === "string" ? parsed.title.trim() : undefined,
+        content: nested.trim(),
+      };
+    }
+  } catch {
+    // Markdown output is the normal path; JSON envelopes are accepted for provider compatibility.
+  }
+  return { content };
+}
+
+function outlineTitleFromOutput(value: string, chapterNumber: number): string {
+  const envelope = unwrapOutlineEnvelope(value);
+  const lines = envelope.content.split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+  const labeledTitles = lines.flatMap((line, index) => {
+    if (!/^(?:#{1,6}\s*)?(?:章纲\s*[|｜:：-]\s*)?(?:章节标题|标题)\s*[：:]?/u.test(line)) return [];
+    const inline = line.replace(/^(?:#{1,6}\s*)?(?:章纲\s*[|｜:：-]\s*)?(?:章节标题|标题)\s*[：:]\s*/u, "").trim();
+    return [inline || lines[index + 1] || ""];
+  });
+  const candidates = [envelope.title || "", ...labeledTitles, ...lines.filter(line => /^#{1,2}\s*.*第\s*(?:\d+|[零〇一二三四五六七八九十百千]+)\s*章/u.test(line))];
+  for (const raw of candidates) {
+    const candidate = raw.replace(/^#{1,6}\s*/u, "").trim()
+      .replace(/^章纲\s*[|｜:：-]\s*/u, "")
+      .replace(/^(?:章节标题|标题)\s*[：:]?/u, "")
+      .replace(/^第\s*(?:\d+|[零〇一二三四五六七八九十百千]+)\s*章\s*[：:、-]?\s*/u, "")
+      .replace(/^《(.+?)》$/u, "$1")
+      .trim();
+    if (candidate && !/^(?:正文|内容|未命名|未命名章节|章节)$/u.test(candidate)) return `第 ${chapterNumber} 章 ${candidate}`;
+  }
+  // Providers occasionally omit the title line but still return a useful
+  // chapter objective. Use that objective as a deterministic local title so
+  // batch generation never saves a bare "第 N 章" when a summary exists.
+  const summaryIndex = lines.findIndex(line => /^(?:#{1,6}\s*)?(?:核心主线与目标|本章目标|章节定位|核心事件)(?:\s*[：:].*)?$/u.test(line));
+  const summary = summaryIndex >= 0
+    ? (lines[summaryIndex].match(/[：:]\s*(.+)$/u)?.[1] || lines[summaryIndex + 1] || "")
+    : "";
+  const compactSummary = summary.replace(/^[-*]\s*/u, "").replace(/[。！？.!?].*$/u, "").trim();
+  if (compactSummary && !/^(?:暂无|无|待定|待揭示)$/u.test(compactSummary)) {
+    return `第 ${chapterNumber} 章 ${compactText(compactSummary, 24)}`;
+  }
+  return `第 ${chapterNumber} 章`;
+}
+
+function normalizeChapterOutlineOutput(value: string): string {
+  let content = unwrapOutlineEnvelope(value).content;
   const graphTail = content.search(/^##\s*(?:实体与关系更新|知识图谱更新)\s*$/imu);
   if (graphTail >= 0) content = content.slice(0, graphTail).trim();
   const lines = content.split(/\r?\n/u);
@@ -2150,7 +2199,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
       const chapterLengthRule = kind === "章纲"
         ? "默认输出不超过700字（包括汉字、数字、空格、换行和标点符号）；压缩表达但不得丢失承接事实、冲突转折、释放点和章末钩子。"
         : "";
-      const dynamicTask = `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "根据上一章正文生成下一章章纲", 1800)}\n${chapterLengthRule}\n\n${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。章纲必须严格逐项填写固定输出协议，不能使用旧的“核心主线与目标”“核心冲突与节奏”“分段剧情梗概”“实体与关系更新”等替代栏目。旧草稿若与唯一正文依据或章节交接状态冲突，必须完全丢弃冲突部分并重写。若作者指令与历史会话冲突，以本次目标章、唯一正文依据、固定输出协议和作者指令为准。不要输出分析过程、格式说明或额外前言。`;
+      const dynamicTask = `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "根据上一章正文生成下一章章纲", 1800)}\n${chapterLengthRule}\n\n${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 标题要求（章纲必须执行）\n标题必须概括本章的核心事件、冲突或爽点，使用 8-24 个汉字或数字；不能只写“第${String(targetChapterNumber || "X")}章”、不能写“未命名”、不能直接复用上一章标题。标题要同时写入 Markdown 首行“# 章纲｜第X章 标题文字”，如果使用 JSON 包装，另返回非空的 title 字段。\n\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。章纲必须严格逐项填写固定输出协议，不能使用旧的“核心主线与目标”“核心冲突与节奏”“分段剧情梗概”“实体与关系更新”等替代栏目。旧草稿若与唯一正文依据或章节交接状态冲突，必须完全丢弃冲突部分并重写。若作者指令与历史会话冲突，以本次目标章、唯一正文依据、固定输出协议和作者指令为准。不要输出分析过程、格式说明或额外前言。`;
       emitter.progress("plan", 48, isNextChapterHandoff ? "步骤 3/5：根据交接状态规划本章事件链与冲突升级" : sourceChapterNumber === targetChapterNumber ? "步骤 3/5：从本章正文提取事件链、冲突与伏笔" : "步骤 3/5：校验指定正文与目标章的事实边界");
       emitter.context("plan", isNextChapterHandoff ? "正在校验上一章结束状态，阻止重复事件" : sourceChapterNumber === targetChapterNumber ? "正在从本章正文提取已发生事件，避免虚构后续" : "正在校验指定正文与目标章的事实边界", { source: isNextChapterHandoff ? "章纲承接规范" : "正文事实校验", status: "loaded", bytes: byteLength(sourceHandoff), items: sourceChapterRecord ? 1 : 0 });
       emitter.progress("draft", 62, "步骤 4/5：调用模型生成章纲正文");
@@ -2170,7 +2219,10 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
       void writePersistentContext(`outline-session-${outlineSessionKey}`, nextOutlineSession.state);
       void writePersistentDocument(`outline-session-${outlineSessionKey}`, `# 大纲会话摘要\n\n${nextOutlineSession.state.summary || "暂无压缩摘要"}`);
       if (nextOutlineSession.compressed) emitter.progress("plan", 90, "会话动态上下文已超过 80%，已自动压缩为摘要并保留最近两轮");
-      return { id: req.id, result: { content: kind === "章纲" ? normalizeChapterOutlineOutput(response.content) : response.content } };
+      return { id: req.id, result: {
+        ...(kind === "章纲" ? { title: outlineTitleFromOutput(response.content, targetChapterNumber || 0) } : {}),
+        content: kind === "章纲" ? normalizeChapterOutlineOutput(response.content) : response.content,
+      } };
     }
     if (req.method === "chapter.write") {
       const {
