@@ -7,6 +7,7 @@ release_dir="${1:-$project_root/release-assets}"
 release_tag="${2:-v0.1.4}"
 build_tools_version="${ANDROID_BUILD_TOOLS_VERSION:-35.0.0}"
 expected_version_code="${ANDROID_VERSION_CODE:-14}"
+expected_version_name="${ANDROID_VERSION_NAME:-${release_tag#v}}"
 
 : "${ANDROID_HOME:=${ANDROID_SDK_ROOT:-}}"
 : "${ANDROID_HOME:?ANDROID_HOME or ANDROID_SDK_ROOT is required}"
@@ -53,7 +54,8 @@ apk_path="$release_dir/$apk_name"
 "$zipalign" -c -p 4 "$apk_path"
 "$apksigner" verify --verbose --print-certs "$apk_path"
 metadata="$($aapt2 dump badging "$apk_path")"
-printf '%s\n' "$metadata" | grep -E "^package: name='com\.apisaverwriter\.app'.*versionName='0\.1\.4'"
+escaped_version_name="${expected_version_name//./\\.}"
+printf '%s\n' "$metadata" | grep -E "^package: name='com\.apisaverwriter\.app'.*versionName='${escaped_version_name}'"
 printf '%s\n' "$metadata" | grep -E "versionCode='${expected_version_code}'"
 unzip -t "$apk_path" >/dev/null
 
