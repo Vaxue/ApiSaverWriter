@@ -301,6 +301,28 @@ fn app_data_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(directory)
 }
 
+fn export_file_name(value: &str) -> String {
+    let mut name = value
+        .chars()
+        .map(|character| if matches!(character, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { character })
+        .collect::<String>();
+    name = name.trim().trim_matches('.').to_string();
+    if name.is_empty() { "未命名小说".to_string() } else { name.chars().take(120).collect() }
+}
+
+#[tauri::command]
+fn export_chapters_txt(app: tauri::AppHandle, book_title: String, content: String) -> Result<String, String> {
+    let directory = if cfg!(any(target_os = "ios", target_os = "android")) {
+        app.path().document_dir().unwrap_or(app_data_directory(&app)?)
+    } else {
+        app.path().download_dir().unwrap_or(app_data_directory(&app)?)
+    };
+    fs::create_dir_all(&directory).map_err(|error| format!("创建导出目录失败: {error}"))?;
+    let path = directory.join(format!("{}.txt", export_file_name(&book_title)));
+    fs::write(&path, content.as_bytes()).map_err(|error| format!("写入 TXT 文件失败: {error}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 fn bdpan_command() -> Result<Command, String> {
     let mut candidates = Vec::new();
     if let Ok(home) = std::env::var("HOME") {
@@ -1923,6 +1945,7 @@ pub fn run() {
             restore_projects_from_baidu,
             load_projects,
             save_projects,
+            export_chapters_txt,
             load_dismantle_books,
             save_dismantle_books,
             load_library_books,

@@ -810,6 +810,7 @@ main {
 .review-scope-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 .review-scope-tabs button { padding: 8px 10px; border: 1px solid #293a51; border-radius: 6px; background: #101a2b; color: #94a3b8; cursor: pointer; }
 .review-scope-tabs button.active { border-color: #38bdf8; background: #12304a; color: #e0f2fe; }
+.review-export-button { justify-self: stretch; }
 .review-chapter-picker { display: grid; gap: 5px; max-height: 180px; padding: 8px; overflow: auto; border: 1px solid #293a51; border-radius: 6px; background: #0d1726; }
 .review-chapter-picker label { display: flex; align-items: center; gap: 8px; padding: 6px; color: #cbd5e1; font-size: 12px; cursor: pointer; }
 .review-chapter-picker input { accent-color: #38bdf8; }

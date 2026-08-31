@@ -1572,6 +1572,7 @@ function App() {
   const [reviewScope, setReviewScope] = useState<'chapter' | 'selected' | 'book'>('chapter');
   const [selectedReviewChapterIds, setSelectedReviewChapterIds] = useState<number[]>([]);
   const [reviewApplyingChapterId, setReviewApplyingChapterId] = useState<number | null>(null);
+  const [chapterExportRunning, setChapterExportRunning] = useState(false);
   const [activeChapter, setActiveChapter] = useState<Chapter | null>(null);
   const [activeOutlineId, setActiveOutlineId] = useState<number | null>(null);
   const [activeCardId, setActiveCardId] = useState<number | null>(null);
@@ -4997,6 +4998,41 @@ function App() {
     }
   };
 
+  const exportAllChaptersTxt = async () => {
+    if (!editingProject || chapterExportRunning) return;
+    const chapters = editingProject.chapters;
+    if (!chapters.length) {
+      setNotice({ title: '暂无可导出章节', content: '请先创建至少一章，再导出 TXT。' });
+      return;
+    }
+    setChapterExportRunning(true);
+    try {
+      const text = `《${editingProject.title}》\n\n${chapters.map((chapter, index) => {
+        const title = chapter.title.trim() || `第 ${index + 1} 章`;
+        return `${title}\n\n${chapter.content.trim()}`;
+      }).join('\n\n')}`;
+      if ('__TAURI_INTERNALS__' in window) {
+        const path = await invoke<string>('export_chapters_txt', { bookTitle: editingProject.title, content: `\uFEFF${text}` });
+        setNotice({ title: 'TXT 导出完成', content: `已导出 ${chapters.length} 章：${path}` });
+      } else {
+        const blob = new Blob([`\uFEFF${text}`], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = `${editingProject.title || '未命名小说'}.txt`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        URL.revokeObjectURL(url);
+        setNotice({ title: 'TXT 导出完成', content: `已下载 ${chapters.length} 章完整正文。` });
+      }
+    } catch (error) {
+      setNotice({ title: 'TXT 导出失败', content: String(error) });
+    } finally {
+      setChapterExportRunning(false);
+    }
+  };
+
   const applyReviewSuggestions = async (chapterId: number) => {
     if (!editingProject || reviewApplyingChapterId !== null) return;
     const report = editingProject.reviewCenter?.chapters.find(item => item.chapterId === chapterId);
@@ -6158,6 +6194,7 @@ function App() {
                   <div className="review-scope-tabs"><button className={reviewScope === 'chapter' ? 'active' : ''} onClick={() => setReviewScope('chapter')}>当前章</button><button className={reviewScope === 'selected' ? 'active' : ''} onClick={() => setReviewScope('selected')}>选择章节</button><button className={reviewScope === 'book' ? 'active' : ''} onClick={() => setReviewScope('book')}>全书</button></div>
                   {reviewScope === 'selected' && <div className="review-chapter-picker">{editingProject.chapters.map(chapter => <label key={chapter.id}><input type="checkbox" checked={selectedReviewChapterIds.includes(chapter.id)} onChange={() => setSelectedReviewChapterIds(current => current.includes(chapter.id) ? current.filter(id => id !== chapter.id) : [...current, chapter.id])} /><span>{chapter.title}</span></label>)}</div>}
                   <button className="btn-primary" disabled={reviewRunning} onClick={() => void runReviewCenter()}>{reviewRunning ? '审查中...' : '开始审查'}</button>
+                  <button className="btn-secondary review-export-button" disabled={chapterExportRunning || !editingProject.chapters.length} onClick={() => void exportAllChaptersTxt()}>{chapterExportRunning ? '导出全部章节中...' : '导出全部章节 TXT'}</button>
                   {report?.chapters?.length ? <div className="review-result-list">{report.chapters.map(item => <article className="review-result-card" key={item.chapterId}><header><div><strong>{item.chapterTitle}</strong><small>{item.reviewedAt ? new Date(item.reviewedAt).toLocaleString() : ''}</small></div><b className={item.score >= 85 ? 'good' : item.score >= 60 ? 'warn' : 'bad'}>{item.score} 分</b></header><p>{item.summary}</p>{item.issues.length ? <div className="review-issue-list">{item.issues.map((issue, index) => <div className={`review-issue ${issue.severity}`} key={`${item.chapterId}-${index}`}><strong>{issue.category}</strong><span>{issue.evidence}</span><p>{issue.suggestion}</p></div>)}</div> : <small className="review-clean">未发现明确冲突</small>}<button className="btn-secondary" disabled={reviewApplyingChapterId === item.chapterId} onClick={() => void applyReviewSuggestions(item.chapterId)}>{reviewApplyingChapterId === item.chapterId ? '修改并保存中...' : '按建议修改并保存'}</button></article>)}</div> : <p className="empty-hint compact">选择范围后开始审查，报告会保存在当前作品。</p>}
                 </div>;
               })()}
