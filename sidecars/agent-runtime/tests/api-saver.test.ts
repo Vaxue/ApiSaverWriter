@@ -213,4 +213,25 @@ describe("API Saver model configuration", () => {
     await expect(request).rejects.toThrow("API 中转服务额度已用尽");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("uses the dedicated image key and returns generated base64 artwork", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      data: [{ b64_json: "aGVsbG8=" }],
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    await expect(new ApiSaverClient({ apiKey: "text-key", defaultModel: "gpt-test" }).generateImage("竖版小说封面", {
+      apiKey: "image-key", model: "gpt-image-2",
+    })).resolves.toMatchObject({ dataUrl: "data:image/png;base64,aGVsbG8=" });
+    expect(fetchMock.mock.calls[0][0]).toBe("https://api.apisaver.com/v1/images/generations");
+    expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({ Authorization: "Bearer image-key" });
+    expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toMatchObject({ model: "gpt-image-2", size: "1024x1536", n: 1 });
+  });
+
+  it("materializes a URL image into a local data URL when the CDN is readable", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ url: "https://cdn.example/cover.png" }] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "Content-Type": "image/png" } }));
+    await expect(new ApiSaverClient({ apiKey: "text-key" }).generateImage("封面", { apiKey: "image-key" }))
+      .resolves.toMatchObject({ dataUrl: "data:image/png;base64,AQID", url: "https://cdn.example/cover.png" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
 });

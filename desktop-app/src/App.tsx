@@ -81,6 +81,27 @@ interface ChapterMemory {
   updatedAt: string;
 }
 
+type PublishPlatform = 'fanqie';
+
+interface PublishConfig {
+  platform: PublishPlatform;
+  enabled: boolean;
+  creatorURL: string;
+  bookId: string;
+  autoPublishOnSave: boolean;
+}
+
+interface PublishRecord {
+  id: string;
+  chapterId: number;
+  chapterTitle: string;
+  platform: PublishPlatform;
+  status: 'published' | 'prepared' | 'login_required' | 'manual_required' | 'error';
+  message: string;
+  url?: string;
+  updatedAt: string;
+}
+
 interface BatchGenerationItem {
   chapterNumber: number;
   title: string;
@@ -122,6 +143,29 @@ interface AIDetectionReport {
   level: string;
   suggestion: string;
   provider: '本地启发式';
+}
+
+interface ChapterReviewIssue {
+  severity: 'high' | 'medium' | 'low';
+  category: string;
+  evidence: string;
+  suggestion: string;
+}
+
+interface ChapterReviewResult {
+  chapterId: number;
+  chapterTitle: string;
+  score: number;
+  summary: string;
+  issues: ChapterReviewIssue[];
+  suggestions: string[];
+  reviewedAt: string;
+}
+
+interface ReviewCenterReport {
+  scope: 'chapter' | 'selected' | 'book';
+  chapters: ChapterReviewResult[];
+  updatedAt: string;
 }
 
 type MemoryDocumentKind = '章节快照' | '人物状态' | '角色认知' | '伏笔追踪' | '时间线' | '设定事实' | '冲突';
@@ -260,11 +304,10 @@ interface Project {
   createdAt: string;
   updatedAt: string;
   wordCount: number;
-  // Legacy metadata is retained verbatim when an existing project is saved.
-  // Automatic publishing is no longer part of the application.
-  publishConfig?: unknown;
-  publishRecords?: unknown;
+  publishConfig?: PublishConfig;
+  publishRecords?: PublishRecord[];
   aiDetection?: AIDetectionReport;
+  reviewCenter?: ReviewCenterReport;
   chapterTargetWords?: number;
   styleProfileId?: string;
   sourceDismantleBookId?: string;
@@ -603,6 +646,9 @@ interface AgentConfig {
   baseURL: string;
   apiKey: string;
   apiKeys: string[];
+  /** Dedicated key for image generation; never used for text requests. */
+  imageApiKey: string;
+  imageModel: string;
   // Model IDs returned by /v1/models are scoped to the authenticated key.
   // Keep the relationship so calls never default to an unrelated first key.
   modelKeyMap: Record<string, string[]>;
@@ -689,6 +735,13 @@ const isAgentWorkflowStep = (value: string | undefined): value is AgentWorkflowS
 const agentRunning = (stage: AgentStage) => !['idle', 'done', 'error'].includes(stage);
 
 const defaultBaseURL = 'https://api.apisaver.com/v1';
+const defaultPublishConfig: PublishConfig = {
+  platform: 'fanqie',
+  enabled: false,
+  creatorURL: 'https://fanqienovel.com/author',
+  bookId: '',
+  autoPublishOnSave: false,
+};
 const memoryQuotaCooldownMs = 5 * 60 * 1000;
 let memoryQuotaRetryAt = 0;
 const isQuotaExceededError = (value: unknown) => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|额度(?:已)?用尽|余额不足/iu.test(String(value));
@@ -726,6 +779,8 @@ const normalizeAgentConfig = (value: unknown): AgentConfig => {
     baseURL: defaultBaseURL,
     apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : apiKeys[0] || '',
     apiKeys,
+    imageApiKey: typeof parsed.imageApiKey === 'string' ? parsed.imageApiKey.trim() : '',
+    imageModel: typeof parsed.imageModel === 'string' && parsed.imageModel.trim() ? parsed.imageModel.trim() : 'gpt-image-2',
     modelKeyMap,
     model: typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : fallbackModels[0],
     contextWindow: Number((parsed as Record<string, unknown>).contextWindowKB ?? (Number(parsed.contextWindow) > 1024 ? Number(parsed.contextWindow) / 1024 : parsed.contextWindow)) || 128,
@@ -1405,10 +1460,8 @@ function App() {
               memoryDocuments: hydrateMemoryDocuments(project.memoryDocuments, Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : []),
               graphNodes: Array.isArray(project.graphNodes) ? project.graphNodes : [],
               graphEdges: normalizeKnowledgeGraphEdges(project.graphEdges),
-              // Keep legacy publish metadata intact when saving older projects.
-              // The automatic publishing feature itself is no longer available.
-              publishConfig: project.publishConfig,
-              publishRecords: project.publishRecords,
+              publishConfig: { ...defaultPublishConfig, ...(project.publishConfig && typeof project.publishConfig === 'object' ? project.publishConfig : {}) },
+              publishRecords: Array.isArray(project.publishRecords) ? project.publishRecords : [],
               chapterTargetWords: Number(project.chapterTargetWords) > 0 ? Number(project.chapterTargetWords) : 3000,
               aiDetection: project.aiDetection,
               styleProfileId: typeof project.styleProfileId === 'string' ? project.styleProfileId : undefined,
@@ -1513,8 +1566,12 @@ function App() {
   
   // 编辑器状态
   const [editingProject, setEditingProject] = useState<Project | null>(null);
-  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'search' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'ai-detect'>('chapters');
+  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'search' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'publish' | 'ai-detect' | 'review'>('chapters');
   const [aiDetecting, setAIDetecting] = useState(false);
+  const [reviewRunning, setReviewRunning] = useState(false);
+  const [reviewScope, setReviewScope] = useState<'chapter' | 'selected' | 'book'>('chapter');
+  const [selectedReviewChapterIds, setSelectedReviewChapterIds] = useState<number[]>([]);
+  const [reviewApplyingChapterId, setReviewApplyingChapterId] = useState<number | null>(null);
   const [activeChapter, setActiveChapter] = useState<Chapter | null>(null);
   const [activeOutlineId, setActiveOutlineId] = useState<number | null>(null);
   const [activeCardId, setActiveCardId] = useState<number | null>(null);
@@ -1715,6 +1772,13 @@ function App() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const highlightLayerRef = useRef<HTMLDivElement | null>(null);
   const goalNoticeChapterRef = useRef<number | null>(null);
+  const [publishRunning, setPublishRunning] = useState(false);
+  const [selectedPublishChapterIds, setSelectedPublishChapterIds] = useState<number[]>([]);
+  const [showPublishChapterPicker, setShowPublishChapterPicker] = useState(false);
+  // React state updates are asynchronous; this ref closes the small window in
+  // which an auto-publish timer and a manual click could both start a run.
+  const publishRunningRef = useRef(false);
+  const publishQueueRunningRef = useRef(false);
   const [settingsDraft, setSettingsDraft] = useState(agentConfig);
   const [availableModels, setAvailableModels] = useState<string[]>(() => {
     try {
@@ -1735,6 +1799,10 @@ function App() {
       return [];
     }
   });
+  // Async agent work can finish after another UI edit. Keep a current snapshot
+  // so background review/outline writes merge into the latest project state.
+  const projectsRef = useRef<Project[]>(projects);
+  projectsRef.current = projects;
   const [customModelName, setCustomModelName] = useState('');
   const [customApiKey, setCustomApiKey] = useState('');
   const [modelsLoading, setModelsLoading] = useState(false);
@@ -1754,6 +1822,7 @@ function App() {
   });
   const [projectGenerationSource, setProjectGenerationSource] = useState<'outline' | 'chapters'>('outline');
   const [projectGeneratingField, setProjectGeneratingField] = useState<'title' | 'synopsis' | null>(null);
+  const [projectCoverGenerating, setProjectCoverGenerating] = useState(false);
   const [newSkill, setNewSkill] = useState({
     name: '',
     category: 'write',
@@ -2190,6 +2259,8 @@ function App() {
         protagonist1: newProject.protagonist1.trim(),
         protagonist2: newProject.protagonist2.trim(),
         synopsis: newProject.synopsis.trim(),
+        publishConfig: existingProject.publishConfig || { ...defaultPublishConfig },
+        publishRecords: existingProject.publishRecords || [],
         updatedAt: now,
       };
       setProjects(current => current.map(project => project.id === updatedProject.id ? updatedProject : project));
@@ -2226,6 +2297,8 @@ function App() {
       memoryDocuments: [],
       graphNodes: [],
       graphEdges: [],
+      publishConfig: { ...defaultPublishConfig },
+      publishRecords: [],
       chapterTargetWords: 3000,
       sourceDismantleBookId: imitationSource?.bookId,
       createdAt: now,
@@ -2346,6 +2419,61 @@ function App() {
       setNotice({ title: field === 'title' ? '书名生成失败' : '作品简介生成失败', content: String(error) });
     } finally {
       setProjectGeneratingField(null);
+    }
+  };
+
+  const compressCoverDataUrl = (source: string): Promise<string> => new Promise(resolve => {
+    if (!source.startsWith('data:image/')) { resolve(source); return; }
+    const image = new Image();
+    image.onload = () => {
+      const maxWidth = 480;
+      const maxHeight = 640;
+      const scale = Math.min(1, maxWidth / image.width, maxHeight / image.height);
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(image.width * scale));
+      canvas.height = Math.max(1, Math.round(image.height * scale));
+      const context = canvas.getContext('2d');
+      if (!context) { resolve(source); return; }
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', 0.82));
+    };
+    image.onerror = () => resolve(source);
+    image.src = source;
+  });
+
+  const generateProjectCover = async () => {
+    if (projectCoverGenerating) return;
+    const imageApiKey = agentConfig.imageApiKey.trim();
+    if (!agentConfig.enabled || !imageApiKey) {
+      setNotice({ title: '需要生图 API Key', content: '请先在设置 > AI 模型配置中填写独立的封面生图 API Key。' });
+      return;
+    }
+    const title = newProject.title.trim() || '未命名小说';
+    const tags = Object.values(newProject.selectedTags).flat().filter(Boolean).join('、');
+    const prompt = `小说封面，书名《${title}》。${newProject.synopsis.trim() ? `故事简介：${newProject.synopsis.trim()}。` : ''}题材：${newProject.channel}${tags ? `，标签：${tags}` : ''}。主角：${newProject.protagonist1.trim() || '原创主角'}${newProject.protagonist2.trim() ? `、${newProject.protagonist2.trim()}` : ''}。竖版网文封面构图，主体突出，具有鲜明叙事感和商业出版质感，预留顶部书名区域，不要生成文字、字母、水印、Logo，细节清晰，光影自然。`;
+    setProjectCoverGenerating(true);
+    try {
+      await invoke<string>('start_agent_runtime');
+      const result = await invoke<{ dataUrl?: string; url?: string }>('call_agent_rpc', {
+        method: 'image.generate',
+        params: {
+          prompt,
+          imageApiKey,
+          imageModel: agentConfig.imageModel || 'gpt-image-2',
+          size: '1024x1536',
+          quality: 'high',
+          ...agentNetworkParams(agentConfig),
+        },
+      });
+      const source = result.dataUrl || result.url || '';
+      if (!source) throw new Error('生图接口没有返回图片');
+      const cover = await compressCoverDataUrl(source);
+      setNewProject(current => ({ ...current, cover }));
+      setNotice({ title: '封面已生成', content: '已自动压缩并回填封面预览，保存小说后生效。' });
+    } catch (error) {
+      setNotice({ title: '封面生成失败', content: String(error) });
+    } finally {
+      setProjectCoverGenerating(false);
     }
   };
 
@@ -3984,7 +4112,8 @@ function App() {
       .map(card => card.id));
     const localProject = refreshCardStatesForProject(localProjectWithMemory, cardsToRefresh);
     const saveProject = async (project: Project) => {
-      const snapshot = projects.map(item => item.id === project.id ? project : item);
+      const snapshot = projectsRef.current.map(item => item.id === project.id ? project : item);
+      projectsRef.current = snapshot;
       setProjects(snapshot);
       setEditingProject(project);
       setActiveChapter(chapter);
@@ -3997,10 +4126,17 @@ function App() {
 
     try {
       await saveProject(localProject);
+      // 保存正文后在后台同步本章章纲；缺失章纲时自动创建并补全。
+      void syncChapterOutlineOnSave(localProject, chapter);
     } catch (error) {
       setNotice({ title: '章节保存失败', content: String(error) });
       setChapterSaving(false);
       return;
+    }
+
+    const publishConfig = { ...defaultPublishConfig, ...(localProject.publishConfig || {}) };
+    if (publishConfig.enabled && publishConfig.autoPublishOnSave) {
+      window.setTimeout(() => void publishChapterToFanqie(chapter, localProject), 0);
     }
 
     if (!chapter.content.trim() || !agentConfig.enabled || !agentConfig.apiKey.trim()) {
@@ -4114,6 +4250,7 @@ function App() {
   const updateEditorProject = (updater: (project: Project) => Project) => {
     if (!editingProject) return;
     const updated = updater(editingProject);
+    projectsRef.current = projectsRef.current.map(project => project.id === updated.id ? updated : project);
     setEditingProject(updated);
     setProjects(current => current.map(project => project.id === updated.id ? updated : project));
   };
@@ -4170,6 +4307,80 @@ function App() {
       && chapterNumberFromText(`${outline.title}\n${outline.content.slice(0, 500)}`) === number)
       || project.outlines.find(outline => outline.kind === '章纲'
         && String(outline.chapterId ?? '') === String(project.chapters[number - 1]?.id ?? ''));
+  };
+
+  const syncChapterOutlineOnSave = async (project: Project, chapter: Chapter) => {
+    const chapterNumber = chapterNumberFromText(chapter.title) || project.chapters.findIndex(item => item.id === chapter.id) + 1;
+    const existing = getChapterOutline(project, chapter) || outlineByChapterNumber(project, chapterNumber);
+    const now = new Date().toISOString();
+    const outline: OutlineDocument = existing || {
+      id: Date.now() + chapter.id,
+      kind: '章纲',
+      chapterId: chapter.id,
+      title: `章纲｜${chapter.title}`,
+      content: `# 章纲｜${chapter.title}\n\n`,
+      createdAt: now,
+      updatedAt: now,
+    };
+    let baseProject = project;
+    if (!existing) {
+      baseProject = {
+        ...project,
+        outlines: [...project.outlines, outline],
+        graphNodes: project.graphNodes.some(node => node.id === `outline:${outline.id}`) ? project.graphNodes : [...project.graphNodes, { id: `outline:${outline.id}`, label: outline.title, type: 'outline', category: '章纲', updatedAt: now }],
+        updatedAt: now,
+      };
+      const initialProjects = projectsRef.current.map(item => item.id === baseProject.id ? baseProject : item);
+      projectsRef.current = initialProjects;
+      setEditingProject(current => current?.id === baseProject.id ? baseProject : current);
+      setProjects(initialProjects);
+      if ('__TAURI_INTERNALS__' in window) void invoke<string>('save_projects', { projects: initialProjects });
+      else localStorage.setItem('projects', JSON.stringify(initialProjects));
+    }
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '章节已保存', content: `${chapter.title} 已创建对应章纲，配置 API Key 后可自动补全章纲。` });
+      return;
+    }
+    try {
+      await invoke<string>('start_agent_runtime');
+      const result = await invoke<{ content?: string; title?: string }>('call_agent_rpc', {
+        method: 'outline.write',
+        params: {
+          runId: `outline-sync-${chapter.id}-${Date.now()}`,
+          outlineId: outline.id,
+          projectId: String(baseProject.id),
+          projectTitle: baseProject.title,
+          kind: '章纲',
+          existingContent: outline.content,
+          instruction: '根据本章已保存正文同步本章章纲。只概括正文中已经发生的事件、人物状态、冲突、信息揭示、伏笔和结尾钩子；保留原章纲中仍然正确的结构，不得虚构正文之后的剧情。',
+          targetChapter: { id: chapter.id, number: chapterNumber, title: chapter.title },
+          sourceChapter: { id: chapter.id, number: chapterNumber, title: chapter.title, content: chapter.content, mode: '保存章节自动同步本章章纲' },
+          synopsis: baseProject.synopsis,
+          cards: baseProject.cards.slice(0, 10),
+          knowledgeGraph: { nodes: baseProject.graphNodes, edges: baseProject.graphEdges },
+          worldSetting: baseProject.outlines.filter(item => item.kind === '世界观与作品设定').map(item => ({ id: item.id, title: item.title, content: item.content })),
+          skills: skills.map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
+          preferredSkillNames: ['小说章纲生成器', 'story-review'],
+          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim(), model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow,
+          ...agentNetworkParams(agentConfig),
+        },
+      });
+      const content = String(result.content || outline.content).trim();
+      const updatedOutline = { ...outline, title: result.title?.trim() || outline.title, content, chapterId: chapter.id, updatedAt: new Date().toISOString() };
+      // Merge only the outline into the latest project so edits made while the
+      // agent was running are retained.
+      const latestProject = projectsRef.current.find(item => item.id === baseProject.id) || baseProject;
+      const merged = { ...latestProject, outlines: latestProject.outlines.map(item => item.id === outline.id ? updatedOutline : item), updatedAt: new Date().toISOString() };
+      const nextProjects = projectsRef.current.map(item => item.id === merged.id ? merged : item);
+      projectsRef.current = nextProjects;
+      setEditingProject(current => current?.id === merged.id ? merged : current);
+      setProjects(nextProjects);
+      if ('__TAURI_INTERNALS__' in window) void invoke<string>('save_projects', { projects: nextProjects });
+      else localStorage.setItem('projects', JSON.stringify(nextProjects));
+      setNotice({ title: '章节与章纲已同步', content: `${chapter.title} 的章纲已根据最新正文更新。` });
+    } catch (error) {
+      setNotice({ title: '章节已保存', content: `章纲同步稍后重试：${String(error)}` });
+    }
   };
 
   const instructionChapterNumber = (instruction: string, pattern: RegExp): number | undefined => {
@@ -4625,6 +4836,208 @@ function App() {
     setSelectedCardIds(current => current.includes(id) ? current.filter(cardId => cardId !== id) : [...current, id]);
   };
 
+  const publishChapterToFanqie = async (chapter: Chapter | null = activeChapter, projectOverride: Project | null = editingProject, queued = false): Promise<Project | null> => {
+    if (!chapter || !projectOverride || (publishRunningRef.current && !queued)) return null;
+      const config = { ...defaultPublishConfig, ...(projectOverride.publishConfig || {}) };
+    if (!config.enabled) {
+      setNotice({ title: '番茄发布未启用', content: '请先在发布面板启用番茄发布并保存配置。' });
+      return null;
+    }
+    if (!chapter.content.trim()) {
+      setNotice({ title: '章节为空', content: '请先保存有正文的章节，再发布到番茄。' });
+      return null;
+    }
+    publishRunningRef.current = true;
+    setPublishRunning(true);
+    try {
+      if (isMobileRuntime()) {
+        const opened = window.open(config.creatorURL, '_blank', 'noopener,noreferrer');
+        if (!opened) window.location.href = config.creatorURL;
+        setNotice({ title: '已打开番茄创作后台', content: '移动端已打开发布页面，请登录后粘贴当前章节标题和正文完成发布。' });
+        return null;
+      }
+      if (!('__TAURI_INTERNALS__' in window)) throw new Error('番茄自动发布需要桌面版应用。');
+      const snapshot = projects.map(item => item.id === projectOverride.id ? projectOverride : item);
+      await invoke<string>('save_projects', { projects: snapshot });
+      const rawResult = await invoke<unknown>('publish_fanqie', {
+        payload: {
+          creatorURL: config.creatorURL.replace(/\/main\/writer(?:\/[^/?]*)?\/?$/u, '/author'),
+          bookId: config.bookId,
+          chapterTitle: chapter.title,
+          content: chapter.content,
+          profileDir: '',
+          headless: true,
+        },
+      });
+      // Treat the sidecar response as untrusted data. A malformed status or
+      // object-valued message must never make the React render tree throw after
+      // the browser has already completed the publish action.
+      const result = rawResult && typeof rawResult === 'object' ? rawResult as Record<string, unknown> : {};
+      const statusValue = typeof result.status === 'string' ? result.status : 'error';
+      const status: PublishRecord['status'] = ['published', 'prepared', 'login_required', 'manual_required', 'error'].includes(statusValue)
+        ? statusValue as PublishRecord['status']
+        : 'error';
+      const message = typeof result.message === 'string'
+        ? result.message
+        : result.message === undefined
+          ? '发布流程完成'
+          : JSON.stringify(result.message) || String(result.message);
+      const url = typeof result.url === 'string' ? result.url : undefined;
+      const record: PublishRecord = {
+        id: `${projectOverride.id}:${chapter.id}:${Date.now()}`,
+        chapterId: chapter.id,
+        chapterTitle: chapter.title,
+        platform: 'fanqie',
+        status,
+        message,
+        url,
+        updatedAt: new Date().toISOString(),
+      };
+      const updatedProject = { ...projectOverride, publishRecords: [...(projectOverride.publishRecords || []), record].slice(-100), updatedAt: new Date().toISOString() };
+      const updatedSnapshot = snapshot.map(item => item.id === updatedProject.id ? updatedProject : item);
+      setProjects(updatedSnapshot);
+      setEditingProject(current => current?.id === updatedProject.id ? updatedProject : current);
+      await invoke<string>('save_projects', { projects: updatedSnapshot });
+      setNotice({ title: status === 'published' ? '番茄发布成功' : status === 'error' ? '番茄发布失败' : '番茄发布流程完成', content: message || '请查看番茄创作后台状态。' });
+      return updatedProject;
+    } catch (error) {
+      setNotice({ title: '番茄发布失败', content: String(error) });
+      return null;
+    } finally {
+      publishRunningRef.current = false;
+      if (!publishQueueRunningRef.current) setPublishRunning(false);
+    }
+  };
+
+  const publishSelectedChaptersToFanqie = async () => {
+    if (!editingProject || publishRunningRef.current || publishQueueRunningRef.current) return;
+    const chapters = editingProject.chapters
+      .filter(chapter => selectedPublishChapterIds.includes(chapter.id) && chapter.content.trim())
+      .sort((a, b) => a.id - b.id);
+    if (!chapters.length) {
+      setNotice({ title: '请选择章节', content: '勾选至少一个有正文的章节后再发布。' });
+      return;
+    }
+    const queuedProject = editingProject;
+    publishQueueRunningRef.current = true;
+    setPublishRunning(true);
+    setNotice({ title: '已加入后台发布队列', content: `共 ${chapters.length} 章，发布将在后台继续进行，完成后通知你。` });
+    window.setTimeout(() => {
+      void (async () => {
+        let workingProject: Project | null = queuedProject;
+        let completed = 0;
+        let failed = 0;
+        for (const chapter of chapters) {
+          const updated = await publishChapterToFanqie(chapter, workingProject, true);
+          if (updated) {
+            workingProject = updated;
+            completed += 1;
+          } else {
+            failed += 1;
+          }
+        }
+        publishQueueRunningRef.current = false;
+        setPublishRunning(false);
+        setNotice({ title: failed ? '后台发布完成（部分失败）' : '后台发布成功', content: `已处理 ${completed} 章${failed ? `，${failed} 章失败，请查看发布记录。` : '，番茄后台已完成提交。'}` });
+      })();
+    }, 0);
+  };
+
+  const runReviewCenter = async () => {
+    if (!editingProject || reviewRunning) return;
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写 API Saver Key，再运行审查中心。' });
+      return;
+    }
+    const chapters = reviewScope === 'chapter'
+      ? (activeChapter ? [activeChapter] : [])
+      : reviewScope === 'selected'
+        ? editingProject.chapters.filter(chapter => selectedReviewChapterIds.includes(chapter.id))
+        : editingProject.chapters;
+    if (!chapters.length) {
+      setNotice({ title: '请选择章节', content: '选择至少一个章节后再开始审查。' });
+      return;
+    }
+    setReviewRunning(true);
+    setNotice({ title: '审查中心已启动', content: `正在后台审查 ${chapters.length} 章，完成后会更新报告。` });
+    const results: ChapterReviewResult[] = [];
+    try {
+      await invoke<string>('start_agent_runtime');
+      for (const chapter of chapters) {
+        const outline = getChapterOutline(editingProject, chapter) || outlineByChapterNumber(editingProject, chapterNumberFromText(chapter.title));
+        const memory = editingProject.memories.find(item => item.chapterId === chapter.id);
+        const result = await invoke<{ score?: number; summary?: string; issues?: ChapterReviewIssue[]; suggestions?: string[] }>('call_agent_rpc', {
+          method: 'chapter.review',
+          params: {
+            projectTitle: editingProject.title,
+            chapterTitle: chapter.title,
+            content: chapter.content,
+            outline: outline?.content,
+            cards: editingProject.cards.filter(card => chapter.content.includes(card.title)).slice(0, 10),
+            memory: memory ? JSON.stringify(memory) : '',
+            apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim(), model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow,
+            ...agentNetworkParams(agentConfig),
+          },
+        });
+        results.push({ chapterId: chapter.id, chapterTitle: chapter.title, score: Math.max(0, Math.min(100, Number(result.score) || 0)), summary: String(result.summary || '审查完成'), issues: Array.isArray(result.issues) ? result.issues : [], suggestions: Array.isArray(result.suggestions) ? result.suggestions : [], reviewedAt: new Date().toISOString() });
+      }
+      const report: ReviewCenterReport = { scope: reviewScope, chapters: results, updatedAt: new Date().toISOString() };
+      const latestProject = projectsRef.current.find(item => item.id === editingProject.id) || editingProject;
+      const updated = { ...latestProject, reviewCenter: report, updatedAt: report.updatedAt };
+      const nextProjects = projectsRef.current.map(item => item.id === updated.id ? updated : item);
+      projectsRef.current = nextProjects;
+      setEditingProject(updated); setProjects(nextProjects);
+      if ('__TAURI_INTERNALS__' in window) await invoke<string>('save_projects', { projects: nextProjects });
+      else localStorage.setItem('projects', JSON.stringify(nextProjects));
+      setNotice({ title: '审查完成', content: `已完成 ${results.length} 章审查，可按建议让 AI 修改并保存。` });
+    } catch (error) {
+      setNotice({ title: '审查失败', content: String(error) });
+    } finally {
+      setReviewRunning(false);
+    }
+  };
+
+  const applyReviewSuggestions = async (chapterId: number) => {
+    if (!editingProject || reviewApplyingChapterId !== null) return;
+    const report = editingProject.reviewCenter?.chapters.find(item => item.chapterId === chapterId);
+    const chapter = editingProject.chapters.find(item => item.id === chapterId);
+    if (!report || !chapter) return;
+    setReviewApplyingChapterId(chapterId);
+    try {
+      await invoke<string>('start_agent_runtime');
+      const advice = [...report.issues.map(issue => `${issue.category}：${issue.suggestion}`), ...report.suggestions].filter(Boolean).join('\n');
+      const result = await invoke<{ content?: string }>('call_agent_rpc', {
+        method: 'text.transform',
+        params: {
+          mode: 'polish', projectTitle: editingProject.title, chapterTitle: chapter.title, content: chapter.content,
+          instruction: `根据以下审查建议修改本章。保持已发生的剧情、人物、时间线、设定和叙事视角，不新增未证实事件；只修复建议涉及的问题，直接输出完整章节正文，不要标题、JSON或解释。\n${advice}`,
+          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim(), model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow,
+          ...agentNetworkParams(agentConfig),
+        },
+      });
+      const content = String(result.content || '').trim();
+      if (!content) throw new Error('AI 没有返回修改后的正文');
+      const now = new Date().toISOString();
+      const updatedChapter = { ...chapter, content, wordCount: countNovelCharacters(content), updatedAt: now };
+      const latestProject = projectsRef.current.find(item => item.id === editingProject.id) || editingProject;
+      const latestChapter = latestProject.chapters.find(item => item.id === chapterId) || chapter;
+      const chapterToSave = { ...latestChapter, ...updatedChapter };
+      const withMemory = buildProjectWithChapterMemory(latestProject, chapterToSave, buildLocalStructuredMemory(chapterToSave, latestProject));
+      const updated = { ...withMemory, updatedAt: now };
+      const nextProjects = projectsRef.current.map(item => item.id === updated.id ? updated : item);
+      projectsRef.current = nextProjects;
+      setEditingProject(updated); setActiveChapter(current => current?.id === chapterId ? chapterToSave : current); setProjects(nextProjects);
+      if ('__TAURI_INTERNALS__' in window) await invoke<string>('save_projects', { projects: nextProjects });
+      else localStorage.setItem('projects', JSON.stringify(nextProjects));
+      void syncChapterOutlineOnSave(updated, chapterToSave);
+      setNotice({ title: '章节已按建议修改', content: `${chapter.title} 已保存，正在后台同步对应章纲。` });
+    } catch (error) {
+      setNotice({ title: '修改失败', content: String(error) });
+    } finally {
+      setReviewApplyingChapterId(null);
+    }
+  };
+
   const runAIDetection = (scope: 'chapter' | 'book') => {
     if (!editingProject) return;
     if (scope === 'chapter' && !activeChapter) {
@@ -4922,7 +5335,7 @@ function App() {
           skills: skills.length,
           models: availableModels.length,
         },
-        apiConfigured: Boolean(agentConfig.apiKey.trim() || agentConfig.apiKeys.some(key => key.trim())),
+        apiConfigured: Boolean(agentConfig.apiKey.trim() || agentConfig.apiKeys.some(key => key.trim()) || agentConfig.imageApiKey.trim()),
       };
       const clientState = Object.fromEntries([
         'agent-config', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage',
@@ -5263,6 +5676,8 @@ function App() {
       baseURL: defaultBaseURL,
       apiKey: apiKeys[0] || '',
       apiKeys,
+      imageApiKey: settingsDraft.imageApiKey.trim(),
+      imageModel: settingsDraft.imageModel.trim() || 'gpt-image-2',
       model: selectedModel,
       contextWindow: Math.max(16, Number(settingsDraft.contextWindow) || 128),
     }, selectedModel));
@@ -5623,7 +6038,7 @@ function App() {
           <header className="editor-header">
             <button className="btn-back" onClick={handleCloseEditor}>← 返回</button>
             <h2>{editingProject.title}</h2>
-            {!outlineMode && !cardMode && !styleMode && editorSidebarTab !== 'search' && <>
+            {!outlineMode && !cardMode && !styleMode && editorSidebarTab !== 'search' && editorSidebarTab !== 'publish' && <>
               <button className="editor-tool-button" title="搜索当前章节" onClick={() => { setShowSearchPanel(true); setSearchScope('chapter'); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索</button>
               <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}>标记</button>
               <button className="editor-tool-button" title="编辑禁词列表" onClick={() => { setBannedWordsDraft(bannedWords.join('\n')); setShowBannedWords(true); }}>禁词</button>
@@ -5703,10 +6118,22 @@ function App() {
                   记忆中心
                 </button>
                 <button
+                  className={editorSidebarTab === 'publish' ? 'active' : ''}
+                  onClick={() => setEditorSidebarTab('publish')}
+                >
+                  发布
+                </button>
+                <button
                   className={editorSidebarTab === 'ai-detect' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('ai-detect')}
                 >
                   AI 检测
+                </button>
+                <button
+                  className={editorSidebarTab === 'review' ? 'active' : ''}
+                  onClick={() => setEditorSidebarTab('review')}
+                >
+                  审查中心
                 </button>
               </div>
               <div className="batch-generation-sidebar-entry">
@@ -5723,6 +6150,18 @@ function App() {
                 </button>
               </div>
 
+              {editorSidebarTab === 'review' && (() => {
+                const report = editingProject.reviewCenter;
+                return <div className="review-center-panel">
+                  <div className="panel-section-title">审查中心 <span>一致性与可读性</span></div>
+                  <p className="review-center-intro">检查章节与章纲、人物卡、时间线和伏笔的一致性；完成后可按建议直接修改正文。</p>
+                  <div className="review-scope-tabs"><button className={reviewScope === 'chapter' ? 'active' : ''} onClick={() => setReviewScope('chapter')}>当前章</button><button className={reviewScope === 'selected' ? 'active' : ''} onClick={() => setReviewScope('selected')}>选择章节</button><button className={reviewScope === 'book' ? 'active' : ''} onClick={() => setReviewScope('book')}>全书</button></div>
+                  {reviewScope === 'selected' && <div className="review-chapter-picker">{editingProject.chapters.map(chapter => <label key={chapter.id}><input type="checkbox" checked={selectedReviewChapterIds.includes(chapter.id)} onChange={() => setSelectedReviewChapterIds(current => current.includes(chapter.id) ? current.filter(id => id !== chapter.id) : [...current, chapter.id])} /><span>{chapter.title}</span></label>)}</div>}
+                  <button className="btn-primary" disabled={reviewRunning} onClick={() => void runReviewCenter()}>{reviewRunning ? '审查中...' : '开始审查'}</button>
+                  {report?.chapters?.length ? <div className="review-result-list">{report.chapters.map(item => <article className="review-result-card" key={item.chapterId}><header><div><strong>{item.chapterTitle}</strong><small>{item.reviewedAt ? new Date(item.reviewedAt).toLocaleString() : ''}</small></div><b className={item.score >= 85 ? 'good' : item.score >= 60 ? 'warn' : 'bad'}>{item.score} 分</b></header><p>{item.summary}</p>{item.issues.length ? <div className="review-issue-list">{item.issues.map((issue, index) => <div className={`review-issue ${issue.severity}`} key={`${item.chapterId}-${index}`}><strong>{issue.category}</strong><span>{issue.evidence}</span><p>{issue.suggestion}</p></div>)}</div> : <small className="review-clean">未发现明确冲突</small>}<button className="btn-secondary" disabled={reviewApplyingChapterId === item.chapterId} onClick={() => void applyReviewSuggestions(item.chapterId)}>{reviewApplyingChapterId === item.chapterId ? '修改并保存中...' : '按建议修改并保存'}</button></article>)}</div> : <p className="empty-hint compact">选择范围后开始审查，报告会保存在当前作品。</p>}
+                </div>;
+              })()}
+
               {editorSidebarTab === 'ai-detect' && (() => {
                 const report = editingProject.aiDetection;
                 const currentDetection = report?.chapters.find(item => item.chapterId === activeChapter?.id);
@@ -5738,6 +6177,32 @@ function App() {
                     <div className="ai-detection-list">{report.chapters.map(item => <button type="button" className="ai-detection-item" key={item.chapterId} onClick={() => { const target = editingProject.chapters.find(chapter => chapter.id === item.chapterId); if (target) setActiveChapter(target); }}><div><strong>{item.chapterTitle}</strong><small>{item.wordCount} 字 · {item.label || '待重新检测'} · 句子均匀度 {item.sentenceUniformity}%</small></div><b className={item.aiRate >= 60 ? 'high' : item.aiRate >= 45 ? 'medium' : 'low'}>{item.aiRate}%</b></button>)}</div>
                     <small className="ai-detection-updated">更新于 {new Date(report.updatedAt).toLocaleString()}</small>
                   </> : <p className="empty-hint compact">尚未检测，选择当前章或全书开始分析。</p>}
+                </div>;
+              })()}
+
+              {editorSidebarTab === 'publish' && (() => {
+                const publishConfig = { ...defaultPublishConfig, ...(editingProject.publishConfig || {}) };
+                const publishRecords = editingProject.publishRecords || [];
+                return <div className="publish-panel">
+                  <div className="panel-section-title">番茄自动发布 <span>本机浏览器自动填充</span></div>
+                  <label className="publish-platform-row"><span>发布平台</span><select className="select" value="fanqie" disabled><option value="fanqie">番茄小说</option></select></label>
+                  <label className="publish-switch-row"><span>启用番茄发布</span><input type="checkbox" checked={publishConfig.enabled} onChange={(event) => updateEditorProject(project => ({ ...project, publishConfig: { ...publishConfig, enabled: event.target.checked } }))} /></label>
+                  <label>番茄创作后台地址<input className="input" value={publishConfig.creatorURL} onChange={(event) => updateEditorProject(project => ({ ...project, publishConfig: { ...publishConfig, creatorURL: event.target.value } }))} /></label>
+                  <label>作品 ID <small>可选，用于直接定位作品</small><input className="input" value={publishConfig.bookId} placeholder="番茄后台作品 ID" onChange={(event) => updateEditorProject(project => ({ ...project, publishConfig: { ...publishConfig, bookId: event.target.value } }))} /></label>
+                  <label className="publish-switch-row"><span>保存章节后自动发布</span><input type="checkbox" checked={publishConfig.autoPublishOnSave} onChange={(event) => updateEditorProject(project => ({ ...project, publishConfig: { ...publishConfig, autoPublishOnSave: event.target.checked } }))} /></label>
+                  <div className="publish-chapter-picker">
+                    <button type="button" className={`publish-picker-trigger ${showPublishChapterPicker ? 'open' : ''}`} onClick={() => setShowPublishChapterPicker(current => !current)} aria-expanded={showPublishChapterPicker}>
+                      <span><strong>发布章节</strong><small>{selectedPublishChapterIds.length ? `已选择 ${selectedPublishChapterIds.length} 章` : '点击选择章节'}</small></span><b aria-hidden="true">⌄</b>
+                    </button>
+                    {showPublishChapterPicker && <div className="publish-picker-menu">
+                      <div className="publish-picker-header"><strong>选择要发布的章节</strong><span>{selectedPublishChapterIds.length} 个已选</span></div>
+                      <div className="publish-picker-actions"><button type="button" className="link-button" onClick={() => setSelectedPublishChapterIds(editingProject.chapters.filter(chapter => chapter.content.trim()).map(chapter => chapter.id))}>全选有正文</button><button type="button" className="link-button" onClick={() => setSelectedPublishChapterIds([])}>清空</button></div>
+                      <div className="publish-chapter-list">{[...editingProject.chapters].reverse().map(chapter => <label className="publish-chapter-option" key={chapter.id}><input type="checkbox" checked={selectedPublishChapterIds.includes(chapter.id)} onChange={() => setSelectedPublishChapterIds(current => current.includes(chapter.id) ? current.filter(id => id !== chapter.id) : [...current, chapter.id])} /><span><strong>{chapter.title}</strong><small>{chapter.wordCount.toLocaleString()} 字{chapter.content.trim() ? '' : ' · 空章节'}</small></span></label>)}</div>
+                    </div>}
+                  </div>
+                  <button className="btn-primary publish-button" disabled={publishRunning || selectedPublishChapterIds.length === 0} onClick={() => void publishSelectedChaptersToFanqie()}>{publishRunning ? '发布中...' : '发布选中章节'}</button>
+                  <p className="publish-hint">按章节管理页已有标题匹配草稿或已发布章节后提交，不会默认新建当前章节。</p>
+                  <div className="publish-records"><div className="panel-section-title">发布记录 <span>{publishRecords.length}</span></div>{publishRecords.length === 0 ? <p className="empty-hint compact">暂无发布记录</p> : [...publishRecords].reverse().slice(0, 8).map(record => <div className="publish-record" key={record.id}><div><strong>{record.chapterTitle}</strong><small>{record.message}</small></div><span className={`publish-status ${record.status}`}>{record.status === 'published' ? '已发布' : record.status === 'login_required' ? '待登录' : record.status === 'prepared' ? '待确认' : '需处理'}</span></div>)}</div>
                 </div>;
               })()}
 
@@ -6539,6 +7004,15 @@ function App() {
                     {(settingsDraft.apiKeys || []).length > 1 && <div className="settings-key-tags">{settingsDraft.apiKeys.map((key, index) => <span key={`${key}-${index}`} className={index === 0 ? 'active' : ''}>Key {index + 1} · {key.slice(0, 4)}••••{key.slice(-4)}<button aria-label={`移除 Key ${index + 1}`} onClick={() => removeApiKey(index)}>×</button></span>)}</div>}
                     <div className="model-add-row"><input className="input" type="password" value={customApiKey} placeholder="添加备用供应商 Key" onChange={(event) => setCustomApiKey(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addApiKey(); } }} /><button className="btn-secondary" onClick={addApiKey}>添加 Key</button></div>
                   </div>
+                  <div className="form-group image-api-config">
+                    <label>封面生图 API Key <small>独立配置，不占用文本模型 Key</small></label>
+                    <input className="input" type="password" value={settingsDraft.imageApiKey} placeholder="请输入封面生图专用 API Key" onChange={(event) => setSettingsDraft({ ...settingsDraft, imageApiKey: event.target.value })} autoComplete="off" />
+                    <div className="settings-grid-two">
+                      <div className="form-group"><label>生图模型</label><input className="input" value={settingsDraft.imageModel} placeholder="gpt-image-2" onChange={(event) => setSettingsDraft({ ...settingsDraft, imageModel: event.target.value })} /></div>
+                      <div className="form-group"><label>生图接口 <small>固定官方服务</small></label><input className="input settings-fixed-address" value="https://api.apisaver.com/v1" readOnly aria-readonly="true" /></div>
+                    </div>
+                    <small className="settings-network-note">用于新建或编辑小说时生成竖版封面，生成结果会自动压缩保存。</small>
+                  </div>
                   <div className="form-group model-management">
                     <label>模型标签 <small>可多选 · 当前模型：{settingsDraft.model || '未选择'}</small></label>
                     <div className="settings-model-tags">
@@ -6729,6 +7203,9 @@ function App() {
                   <input type="file" accept="image/png,image/jpeg,image/webp" onChange={handleCoverChange} />
                   选择封面
                 </label>
+                <button className="btn-secondary cover-ai-button" type="button" disabled={projectCoverGenerating} onClick={() => void generateProjectCover()}>
+                  {projectCoverGenerating ? '生成封面中...' : 'AI 生成封面'}
+                </button>
                 <p>支持 JPG、PNG、WebP，自动压缩保存</p>
               </aside>
 

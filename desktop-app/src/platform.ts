@@ -1398,6 +1398,39 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
   if (method === 'book.sources.list') {
     return { sources: [{ id: 'fanqie', name: '番茄小说' }, ...mobileQianyueSources.map(source => ({ id: source.id, name: source.name }))], defaultSourceId: mobileQianyueSources[0]?.id || 'fanqie' } as T;
   }
+  if (method === 'image.generate') {
+    const imageApiKey = stringValue(params.imageApiKey).trim();
+    const prompt = stringValue(params.prompt).trim();
+    if (!imageApiKey || !prompt) throw new Error('请先填写封面生图 API Key 和提示词');
+    const model = stringValue(params.imageModel, 'gpt-image-2').trim() || 'gpt-image-2';
+    const response = await fetcher('https://api.apisaver.com/v1/images/generations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${imageApiKey}` },
+      body: JSON.stringify({ model, prompt: prompt.replace(/\s+/gu, ' ').trim(), size: stringValue(params.size, '1024x1536'), quality: stringValue(params.quality, 'high'), n: 1 }),
+    });
+    const raw = await response.text();
+    if (!response.ok) throw new Error(`生图接口返回 ${response.status}：${raw.replace(/\s+/gu, ' ').slice(0, 240)}`);
+    let payload: Record<string, unknown>;
+    try { payload = JSON.parse(raw) as Record<string, unknown>; } catch { throw new Error('生图接口返回了无效 JSON'); }
+    const first = Array.isArray(payload.data) && payload.data[0] && typeof payload.data[0] === 'object' ? payload.data[0] as Record<string, unknown> : undefined;
+    const b64 = stringValue(first?.b64_json).trim();
+    const url = stringValue(first?.url).trim();
+    if (!b64 && !url) throw new Error('生图接口没有返回图片');
+    if (!b64 && url) {
+      try {
+        const imageResponse = await fetcher(url);
+        if (imageResponse.ok) {
+          const bytes = new Uint8Array(await imageResponse.arrayBuffer());
+          let binary = '';
+          const chunkSize = 0x8000;
+          for (let index = 0; index < bytes.length; index += chunkSize) binary += String.fromCharCode(...bytes.subarray(index, Math.min(bytes.length, index + chunkSize)));
+          const contentType = imageResponse.headers.get('content-type') || 'image/png';
+          return { dataUrl: `data:${contentType};base64,${btoa(binary)}`, url, ...(stringValue(first?.revised_prompt) ? { revisedPrompt: stringValue(first?.revised_prompt) } : {}) } as T;
+        }
+      } catch { /* Keep the remote URL as a fallback when CDN fetch is unavailable. */ }
+    }
+    return { ...(b64 ? { dataUrl: `data:image/png;base64,${b64}` } : {}), ...(url ? { url } : {}), ...(stringValue(first?.revised_prompt) ? { revisedPrompt: stringValue(first?.revised_prompt) } : {}) } as T;
+  }
   if (method === 'gateway.usage') {
     const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
     if (!keys.length) throw new Error('请先在设置中填写 API Key。');

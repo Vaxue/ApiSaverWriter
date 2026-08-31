@@ -1,6 +1,6 @@
 {
   "productName": "ApiSaverWriter",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "identifier": "com.apisaverwriter.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -12,6 +12,7 @@
     "active": true,
     "targets": "all",
     "resources": {
+      "fanqie_publish.py": "fanqie_publish.py",
       "runtime/agent-runtime": "agent-runtime"
     },
     "icon": [

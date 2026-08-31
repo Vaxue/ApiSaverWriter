@@ -121,6 +121,12 @@ export interface ChatOptions {
   retryAttempts?: number;
 }
 
+export interface ImageGenerationResult {
+  dataUrl?: string;
+  url?: string;
+  revisedPrompt?: string;
+}
+
 export interface ApiUsage {
   inputTokens?: number;
   outputTokens?: number;
@@ -307,6 +313,71 @@ export class ApiSaverClient {
 
   constructor(config: ApiSaverClientConfig) {
     this.config = config;
+  }
+
+  async generateImage(prompt: string, options: { apiKey?: string; model?: string; size?: string; quality?: string } = {}): Promise<ImageGenerationResult> {
+    const key = String(options.apiKey || this.config.apiKey || '').trim();
+    if (!key) throw new Error('缺少生图 API Key');
+    const model = String(options.model || 'gpt-image-2').trim() || 'gpt-image-2';
+    const endpoint = `${API_SAVER_BASE_URL}/images/generations`;
+    const dispatcher = proxyDispatcherFor(endpoint, this.config);
+    const body = JSON.stringify({
+      model,
+      prompt: normalizePromptWhitespace(prompt),
+      size: options.size || '1024x1536',
+      quality: options.quality || 'high',
+      n: 1,
+    });
+    let lastError = '';
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json', Authorization: `Bearer ${key}` },
+          body,
+          ...(dispatcher ? { dispatcher } : {}),
+        } as RequestInit);
+        const raw = await response.text();
+        if (!response.ok) {
+          lastError = apiErrorMessage(response.status, raw, response.statusText, attempt, proxyRouteHint(endpoint, this.config), `，模型 ${model} · ${endpoint}`);
+          if ([408, 429, 500, 502, 503, 504, 524].includes(response.status) && !isQuotaExceeded(raw) && attempt < 3) {
+            await sleep(700 * 2 ** (attempt - 1));
+            continue;
+          }
+          throw new Error(lastError);
+        }
+        let payload: Record<string, unknown>;
+        try { payload = JSON.parse(raw) as Record<string, unknown>; }
+        catch { throw new Error('生图接口返回了无效 JSON'); }
+        const first = Array.isArray(payload.data) && payload.data[0] && typeof payload.data[0] === 'object'
+          ? payload.data[0] as Record<string, unknown>
+          : undefined;
+        const b64 = typeof first?.b64_json === 'string' ? first.b64_json.trim() : '';
+        const url = typeof first?.url === 'string' ? first.url.trim() : '';
+        if (!b64 && !url) throw new Error('生图接口没有返回图片');
+        if (!b64 && url) {
+          try {
+            const imageResponse = await fetch(url, { ...(dispatcher ? { dispatcher } : {}) } as RequestInit);
+            if (imageResponse.ok) {
+              const contentType = imageResponse.headers.get('content-type') || 'image/png';
+              const encoded = Buffer.from(await imageResponse.arrayBuffer()).toString('base64');
+              return { dataUrl: `data:${contentType};base64,${encoded}`, url, ...(typeof first?.revised_prompt === 'string' ? { revisedPrompt: first.revised_prompt } : {}) };
+            }
+          } catch { /* Keep the remote URL as a fallback when CDN fetch is unavailable. */ }
+        }
+        return {
+          ...(b64 ? { dataUrl: `data:image/png;base64,${b64}` } : {}),
+          ...(url ? { url } : {}),
+          ...(typeof first?.revised_prompt === 'string' ? { revisedPrompt: first.revised_prompt } : {}),
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.startsWith('API ')) throw error;
+        lastError = message;
+        if (attempt < 3) { await sleep(500 * 2 ** (attempt - 1)); continue; }
+      }
+    }
+    throw new Error(lastError || '生图请求失败');
   }
 
   private async modelsForKey(key: string): Promise<Set<string> | undefined> {

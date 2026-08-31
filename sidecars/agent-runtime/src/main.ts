@@ -286,6 +286,10 @@ const memoryEditorSystemPrompt = `你是长篇小说的记忆编辑。只从章�
 
 输出必须是严格 JSON 对象，不要代码围栏或解释。摘要应简短、可检索、包含事件推进、人物状态和未解决线索。实体与关系必须有正文依据；卡片只在状态确有变化且正文能证明时更新。`;
 
+const chapterReviewSystemPrompt = `你是长篇小说审查中心编辑。只依据给定的章节正文、章纲、人物卡和设定资料审查，不补写剧情，不把风格偏好伪装成事实错误。
+重点检查：章节与章纲是否一致、人物状态和认知是否前后一致、时间线与地点是否矛盾、设定和力量规则是否冲突、伏笔与冲突是否断裂、标题和结尾钩子是否有效、明显重复段落和病句。
+输出严格 JSON 对象，不要代码围栏或额外文字：{"score":0,"summary":"","issues":[{"severity":"high|medium|low","category":"","evidence":"原文短引","suggestion":"可执行修改建议"}],"suggestions":["..."]}。score 为 0-100；没有问题时 issues 为空。`;
+
 const stringList = (value: unknown, limit = 20): string[] => Array.isArray(value)
   ? value.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, limit)
   : [];
@@ -1519,6 +1523,26 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
       await client.chat([{ role: "user", content: "请只回复 OK" }], { max_tokens: 256, temperature: 0, retryAttempts: 2 });
       return { id: req.id, result: { tested: true, model: String(model) } };
     }
+    if (req.method === "image.generate") {
+      const { prompt, imageApiKey, imageModel, size, quality } = req.params ?? {};
+      if (!String(prompt || '').trim() || !String(imageApiKey || '').trim()) {
+        return { id: req.id, error: { code: -32602, message: "请先填写封面生图 API Key 和提示词" } };
+      }
+      const client = new ApiSaverClient({
+        apiKey: String(imageApiKey),
+        baseURL: "https://api.apisaver.com/v1",
+        defaultModel: String(imageModel || "gpt-image-2"),
+        apiMode: "openai",
+        ...networkProxyConfig(req.params),
+      });
+      const result = await client.generateImage(String(prompt), {
+        apiKey: String(imageApiKey),
+        model: String(imageModel || "gpt-image-2"),
+        size: String(size || "1024x1536"),
+        quality: String(quality || "high"),
+      });
+      return { id: req.id, result };
+    }
     if (req.method === "project.generate") {
       const { field, source, title, synopsis, channel, tags, protagonist1, protagonist2, outlines, chapters, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
       if (!apiKey || (field !== "title" && field !== "synopsis")) {
@@ -2223,6 +2247,62 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         ...(kind === "章纲" ? { title: outlineTitleFromOutput(response.content, targetChapterNumber || 0) } : {}),
         content: kind === "章纲" ? normalizeChapterOutlineOutput(response.content) : response.content,
       } };
+    }
+    if (req.method === "chapter.review") {
+      const { projectTitle, chapterTitle, content, outline, cards, memory, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      if (!projectTitle || !chapterTitle || !content || !apiKey) {
+        return { id: req.id, error: { code: -32602, message: "缺少章节审查所需参数" } };
+      }
+      const client = new ApiSaverClient({
+        apiKey: String(apiKey),
+        apiKeys: stringList(apiKeys, 12),
+        baseURL: String(baseURL || "https://api.apisaver.com/v1"),
+        defaultModel: String(model || "gpt-4o-mini"),
+        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        reasoningMode: String(reasoningMode || "auto"),
+        contextWindowKB: Number(contextWindow) || undefined,
+        ...networkProxyConfig(req.params),
+      });
+      const cardContext = Array.isArray(cards) && cards.length
+        ? cards.slice(0, 10).map(item => item && typeof item === "object" ? `${String((item as Record<string, unknown>).title || "卡片")}: ${compactText((item as Record<string, unknown>).content || "", 500)}` : "").filter(Boolean).join("\n")
+        : "暂无人物卡或设定卡";
+      const prompt = `## 作品：${compactText(projectTitle, 180)}
+## 章节：${compactText(chapterTitle, 180)}
+## 对应章纲
+${compactText(outline || "暂无章纲", 6000)}
+## 相关卡片
+${cardContext}
+## 上一版章节记忆
+${compactText(memory || "暂无记忆", 2600)}
+## 待审查正文
+${compactText(content, 26000)}
+
+请按审查规则输出 JSON。问题必须引用正文中的短证据，建议必须能直接指导作者修改；优先报告会造成读者理解错误的硬冲突。`;
+      const response = await client.chat([
+        { role: "system", content: chapterReviewSystemPrompt },
+        { role: "user", content: prompt },
+      ], { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 1800, retryAttempts: 2 });
+      try {
+        const raw = JSON.parse(response.content) as Record<string, unknown>;
+        const issues = Array.isArray(raw.issues) ? raw.issues.filter(item => item && typeof item === "object").slice(0, 30).map(item => {
+          const issue = item as Record<string, unknown>;
+          const severity = String(issue.severity || "medium").toLowerCase();
+          return {
+            severity: severity === "high" ? "high" : severity === "low" ? "low" : "medium",
+            category: compactText(issue.category || "一致性", 60),
+            evidence: compactText(issue.evidence || "", 220),
+            suggestion: compactText(issue.suggestion || issue.fix || "", 500),
+          };
+        }).filter(item => item.evidence || item.suggestion) : [];
+        return { id: req.id, result: {
+          score: Math.max(0, Math.min(100, Number(raw.score) || (issues.length ? Math.max(35, 90 - issues.length * 8) : 95))),
+          summary: compactText(raw.summary || "审查完成", 600),
+          issues,
+          suggestions: stringList(raw.suggestions, 12),
+        } };
+      } catch {
+        return { id: req.id, result: { score: 0, summary: "审查结果解析失败，请重试。", issues: [], suggestions: [] } };
+      }
     }
     if (req.method === "chapter.write") {
       const {

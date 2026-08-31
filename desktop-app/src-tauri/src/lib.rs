@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, Manager, State};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +40,10 @@ impl Drop for AgentRuntimeProcess {
 struct AgentRuntimeState {
     process: Arc<Mutex<Option<AgentRuntimeProcess>>>,
 }
+
+// save_projects removes and recreates project subdirectories. Serialize every
+// writer so background memory updates cannot race with publishing or backups.
+static PROJECT_SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn node_executable() -> Result<PathBuf, String> {
     let mut candidates = Vec::new();
@@ -205,6 +209,55 @@ async fn call_agent_rpc(app: tauri::AppHandle, state: State<'_, AgentRuntimeStat
     tauri::async_runtime::spawn_blocking(move || call_agent_rpc_blocking(app, process, method, params))
         .await
         .map_err(|error| format!("Agent 任务线程退出：{error}"))?
+}
+
+#[tauri::command]
+fn publish_fanqie(app: tauri::AppHandle, payload: Value) -> Result<Value, String> {
+    // Keep browser/driver failures inside the command boundary. A panic from
+    // a platform subprocess must never take down the Tauri process.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| publish_fanqie_inner(app, payload)))
+        .map_err(|_| "番茄发布进程发生异常，应用仍在运行，请重试".to_string())?
+}
+
+fn publish_fanqie_inner(app: tauri::AppHandle, payload: Value) -> Result<Value, String> {
+    let script = [
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fanqie_publish.py"),
+        app.path().resource_dir().unwrap_or_else(|_| PathBuf::from(".")).join("fanqie_publish.py"),
+    ].into_iter().find(|path| path.exists()).ok_or_else(|| "找不到番茄发布脚本".to_string())?;
+    let input = serde_json::to_vec(&payload).map_err(|error| format!("序列化发布参数失败：{error}"))?;
+    let mut last_error = String::new();
+    for executable in ["python3", "python", "/opt/anaconda3/bin/python"] {
+        let mut child = match Command::new(executable)
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => { last_error = error.to_string(); continue; }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(error) = stdin.write_all(&input) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("发送发布参数失败：{error}"));
+            }
+        }
+        let output = child.wait_with_output().map_err(|error| format!("等待番茄发布失败：{error}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(line) = stdout.lines().rev().find(|line| !line.trim().is_empty()) {
+            let parsed: Value = serde_json::from_str(line).map_err(|error| format!("解析番茄发布结果失败：{error}"))?;
+            if parsed.get("status").and_then(Value::as_str) == Some("missing_runtime") {
+                last_error = parsed.get("message").and_then(Value::as_str).unwrap_or("Python Playwright 不可用").to_string();
+                continue;
+            }
+            return Ok(parsed);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        last_error = if stderr.is_empty() { format!("{executable} 退出状态 {}", output.status) } else { stderr };
+    }
+    Err(format!("找不到可用 Python 运行时：{last_error}"))
 }
 
 fn agent_runtime_script() -> Result<PathBuf, String> {
@@ -797,6 +850,8 @@ fn load_projects(app: tauri::AppHandle) -> Result<Option<Value>, String> {
 
 #[tauri::command]
 fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, String> {
+    let save_lock = PROJECT_SAVE_LOCK.get_or_init(|| Mutex::new(()));
+    let _save_guard = save_lock.lock().map_err(|_| "小说数据保存锁定失败".to_string())?;
     let app_data = app_data_directory(&app)?;
     let root = app_data.join("projects");
     fs::create_dir_all(&root).map_err(|error| format!("创建小说目录失败: {error}"))?;
@@ -1859,6 +1914,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_agent_runtime,
             call_agent_rpc,
+            publish_fanqie,
             cloud_sync_status,
             baidu_login_url,
             complete_baidu_login,
