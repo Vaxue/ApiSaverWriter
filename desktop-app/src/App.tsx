@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, type ChangeEvent } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import './App.css';
-import { countNovelCharacters } from './utils/text';
+import { compactText, countNovelCharacters } from './utils/text';
 import { builtinSkills } from './data/builtin-skills';
 
 export interface Skill {
@@ -150,6 +150,7 @@ interface ChapterReviewIssue {
   category: string;
   evidence: string;
   suggestion: string;
+  applied?: boolean;
 }
 
 interface ChapterReviewResult {
@@ -314,7 +315,7 @@ interface Project {
   authorPreferences?: string[];
 }
 
-type DismantleChapterStatus = 'pending' | 'analyzing' | 'analyzed' | 'rewritten';
+type DismantleChapterStatus = 'pending' | 'analyzing' | 'analyzed' | 'rewritten' | 'failed';
 
 interface DismantleChapter {
   id: string;
@@ -633,6 +634,7 @@ type AgentStage = 'idle' | 'starting' | 'intent' | 'retrieve' | 'plan' | 'draft'
 type ApiMode = 'openai' | 'responses' | 'anthropic';
 type ReasoningMode = 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max' | 'custom';
 type AgentProgressStatus = 'pending' | 'active' | 'complete' | 'error';
+type ReviewSidebarPage = 'home' | 'chapters' | 'reports';
 
 const skillCategoryLabels: Record<string, string> = {
   setup: '项目设置', write: '写作', review: '审查', polish: '润色',
@@ -863,7 +865,8 @@ const normalizeDismantleChapter = (chapter: Partial<DismantleChapter>, index: nu
   setupPayoff: asTextList(chapter.setupPayoff, 10),
   pacing: typeof chapter.pacing === 'string' ? chapter.pacing : '',
   rewriteContent: typeof chapter.rewriteContent === 'string' ? chapter.rewriteContent : '',
-  status: chapter.status === 'analyzing' || chapter.status === 'analyzed' || chapter.status === 'rewritten' ? chapter.status : 'pending',
+  // 应用在分析中被关闭时，旧的 analyzing 状态必须变成可续拆的失败状态。
+  status: chapter.status === 'analyzed' || chapter.status === 'rewritten' || chapter.status === 'failed' ? chapter.status : chapter.status === 'analyzing' ? 'failed' : 'pending',
   sourcePath: typeof chapter.sourcePath === 'string' ? chapter.sourcePath : undefined,
   outlinePath: typeof chapter.outlinePath === 'string' ? chapter.outlinePath : undefined,
   rewritePath: typeof chapter.rewritePath === 'string' ? chapter.rewritePath : undefined,
@@ -1527,6 +1530,7 @@ function App() {
   const [activeDismantleChapterId, setActiveDismantleChapterId] = useState<string | null>(null);
   const [selectedDismantleChapterIds, setSelectedDismantleChapterIds] = useState<string[]>([]);
   const [dismantleRunningIds, setDismantleRunningIds] = useState<string[]>([]);
+  const [dismantleProgress, setDismantleProgress] = useState<{ bookId: string; completed: number; total: number; current?: number; failed?: number }>({ bookId: '', completed: 0, total: 0 });
   const [dismantleRewriteRunning, setDismantleRewriteRunning] = useState(false);
   const [dismantleRewriteInstruction, setDismantleRewriteInstruction] = useState('保留章节的冲突强度和推进节奏，重构为独立原创故事。');
   const [styleDistilling, setStyleDistilling] = useState(false);
@@ -1566,12 +1570,14 @@ function App() {
   
   // 编辑器状态
   const [editingProject, setEditingProject] = useState<Project | null>(null);
-  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'search' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'publish' | 'ai-detect' | 'review'>('chapters');
+  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'search' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'publish' | 'ai-detect' | 'review' | 'export'>('chapters');
   const [aiDetecting, setAIDetecting] = useState(false);
   const [reviewRunning, setReviewRunning] = useState(false);
-  const [reviewScope, setReviewScope] = useState<'chapter' | 'selected' | 'book'>('chapter');
+  const [reviewScope, setReviewScope] = useState<'selected' | 'book'>('selected');
+  const [reviewSidebarPage, setReviewSidebarPage] = useState<ReviewSidebarPage>('home');
   const [selectedReviewChapterIds, setSelectedReviewChapterIds] = useState<number[]>([]);
-  const [reviewApplyingChapterId, setReviewApplyingChapterId] = useState<number | null>(null);
+  const [reviewActiveChapterId, setReviewActiveChapterId] = useState<number | null>(null);
+  const [reviewApplyingIssueKey, setReviewApplyingIssueKey] = useState<string | null>(null);
   const [chapterExportRunning, setChapterExportRunning] = useState(false);
   const [activeChapter, setActiveChapter] = useState<Chapter | null>(null);
   const [activeOutlineId, setActiveOutlineId] = useState<number | null>(null);
@@ -2542,6 +2548,7 @@ function App() {
     if (existing) {
       setActiveDismantleBookId(existing.id);
       setActiveDismantleChapterId(existing.chapters[0]?.id || null);
+      setSelectedDismantleChapterIds(existing.chapters.filter(chapter => chapter.status === 'pending' || chapter.status === 'failed').map(chapter => chapter.id));
       setActiveTab('dismantles');
       setNotice({ title: '已打开拆书资料', content: `《${book.title}》已经在拆书管理中。` });
       return;
@@ -2554,7 +2561,7 @@ function App() {
     setDismantleBooks(current => [...current, dismantle]);
     setActiveDismantleBookId(dismantle.id);
     setActiveDismantleChapterId(chapters[0]?.id || null);
-    setSelectedDismantleChapterIds(chapters.slice(0, 1).map(chapter => chapter.id));
+    setSelectedDismantleChapterIds(chapters.map(chapter => chapter.id));
     setActiveTab('dismantles');
     setNotice({ title: '已加入拆书管理', content: `《${book.title}》共 ${chapters.length} 章可分析。` });
   };
@@ -2821,12 +2828,12 @@ function App() {
     }
   };
 
-  const runDismantleAnalysis = async () => {
+  const runDismantleAnalysis = async (chapterIds = selectedDismantleChapterIds) => {
     const book = dismantleBooks.find(item => item.id === activeDismantleBookId);
     if (!book) return;
-    const targets = book.chapters.filter(chapter => selectedDismantleChapterIds.includes(chapter.id) && chapter.sourceContent.trim());
+    const targets = book.chapters.filter(chapter => chapterIds.includes(chapter.id) && chapter.sourceContent.trim() && chapter.status !== 'analyzed' && chapter.status !== 'rewritten');
     if (!targets.length) {
-      setNotice({ title: '请选择章节', content: '勾选至少一章正文后再生成章纲。' });
+      setNotice({ title: '没有待分析章节', content: '已生成章节会自动跳过；请勾选待分析章节，或点击“继续拆书”。' });
       return;
     }
     if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
@@ -2834,32 +2841,66 @@ function App() {
       return;
     }
     setDismantleRunningIds(targets.map(chapter => chapter.id));
+    setDismantleProgress({ bookId: book.id, completed: 0, total: targets.length, current: targets[0]?.number });
     let completed = 0;
+    let failed: DismantleChapter | undefined;
     try {
       for (const chapter of targets) {
+        setDismantleProgress(current => ({ ...current, current: chapter.number }));
         updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? { ...item, status: 'analyzing' } : item), updatedAt: new Date().toISOString() }));
-        const result = await invoke<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('call_agent_rpc', {
-          method: 'book.dismantle',
-          params: {
-            bookTitle: book.title, chapterTitle: chapter.title, chapterNumber: chapter.number, sourceContent: chapter.sourceContent,
-            apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
-            model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
-            contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
-          },
-        });
-        updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? {
-          ...item, summary: result.summary?.trim() || item.summary, detailedOutline: result.detailedOutline?.trim() || item.detailedOutline,
-          plotBeats: asTextList(result.plotBeats, 10), characterDynamics: asTextList(result.characterDynamics, 10), setupPayoff: asTextList(result.setupPayoff, 10),
-          pacing: result.pacing?.trim() || item.pacing, status: result.detailedOutline?.trim() ? 'analyzed' : item.status, updatedAt: new Date().toISOString(),
-        } : item), updatedAt: new Date().toISOString() }));
-        completed += 1;
+        try {
+          const target = book.boundProjectId ? projects.find(project => project.id === book.boundProjectId) : undefined;
+          const targetChapter = target
+            ? target.chapters.find(item => chapterNumberFromText(item.title) === chapter.number)
+              || { id: -Math.max(1, chapter.number), title: `第${chapter.number}章`, content: '', wordCount: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }
+            : undefined;
+          const targetContext = target && targetChapter ? buildWritingContext(target, targetChapter, '拆解章节并映射到目标作品设定', chapter.title) : undefined;
+          const result = await invoke<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('call_agent_rpc', {
+            method: 'book.dismantle',
+            params: {
+              bookTitle: book.title, chapterTitle: chapter.title, chapterNumber: chapter.number, sourceContent: chapter.sourceContent,
+              targetProjectTitle: target?.title, targetProjectSynopsis: target?.synopsis,
+              targetWorldSetting: target?.outlines.filter(item => item.kind === '世界观与作品设定').map(item => ({ id: item.id, title: item.title, content: item.content })),
+              targetOutlines: target?.outlines.map(item => ({ id: item.id, kind: item.kind, title: item.title, chapterId: item.chapterId, content: item.content })),
+              targetCards: targetContext?.cards, targetKnowledgeGraph: target ? { nodes: target.graphNodes, edges: target.graphEdges } : undefined,
+              apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+              model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
+              contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
+            },
+          });
+          if (!result.detailedOutline?.trim() && !result.summary?.trim()) throw new Error('智能体没有返回有效拆书结果');
+          updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? {
+            ...item, summary: result.summary?.trim() || item.summary, detailedOutline: result.detailedOutline?.trim() || item.detailedOutline,
+            plotBeats: asTextList(result.plotBeats, 10), characterDynamics: asTextList(result.characterDynamics, 10), setupPayoff: asTextList(result.setupPayoff, 10),
+            pacing: result.pacing?.trim() || item.pacing, status: 'analyzed', updatedAt: new Date().toISOString(),
+          } : item), updatedAt: new Date().toISOString() }));
+          completed += 1;
+          setDismantleProgress(current => ({ ...current, completed }));
+        } catch (error) {
+          failed = chapter;
+          updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? { ...item, status: 'failed', updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }));
+          setDismantleProgress(current => ({ ...current, completed, failed: chapter.number }));
+          throw error;
+        }
       }
       setNotice({ title: '拆书章纲已生成', content: `已完成 ${completed} 章，章纲和分析结果会自动保存。` });
     } catch (error) {
-      setNotice({ title: '拆书分析失败', content: String(error) });
+      setNotice({ title: '拆书分析已暂停', content: `${failed ? `第${failed.number}章失败。` : ''}已完成 ${completed}/${targets.length} 章，点击“继续拆书”会从失败章节继续。${String(error)}` });
     } finally {
       setDismantleRunningIds([]);
     }
+  };
+
+  const continueDismantleAnalysis = () => {
+    const book = dismantleBooks.find(item => item.id === activeDismantleBookId);
+    if (!book) return;
+    const pendingIds = book.chapters.filter(chapter => (chapter.status === 'pending' || chapter.status === 'failed') && chapter.sourceContent.trim()).map(chapter => chapter.id);
+    if (!pendingIds.length) {
+      setNotice({ title: '拆书已完成', content: '当前作品没有待分析或失败章节。' });
+      return;
+    }
+    setSelectedDismantleChapterIds(pendingIds);
+    void runDismantleAnalysis(pendingIds);
   };
 
   const runDismantleRewrite = async () => {
@@ -2875,11 +2916,25 @@ function App() {
     }
     setDismantleRewriteRunning(true);
     try {
+      const targetChapter = target.chapters.find(item => chapterNumberFromText(item.title) === chapter.number)
+        || { id: -Math.max(1, chapter.number), title: `第${chapter.number}章`, content: '', wordCount: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      const outlineText = [chapter.detailedOutline, chapter.summary, chapter.characterDynamics.join('；')].filter(Boolean).join('\n');
+      const writingContext = buildWritingContext(target, targetChapter, dismantleRewriteInstruction, outlineText);
       const result = await invoke<{ content?: string }>('call_agent_rpc', {
         method: 'book.rewrite',
         params: {
           bookTitle: book.title, chapterTitle: chapter.title, detailedOutline: chapter.detailedOutline,
           instruction: dismantleRewriteInstruction, targetWords: 2200,
+          targetProjectTitle: target.title, targetProjectSynopsis: target.synopsis,
+          targetProjectOutlines: target.outlines.map(outline => ({ id: outline.id, kind: outline.kind, title: outline.title, chapterId: outline.chapterId, content: outline.content })),
+          targetWorldSetting: target.outlines.filter(outline => outline.kind === '世界观与作品设定').map(outline => ({ id: outline.id, title: outline.title, content: outline.content })),
+          cards: writingContext.cards, knowledgeGraph: { nodes: target.graphNodes, edges: target.graphEdges },
+          previousChapters: writingContext.previous ? [{ id: writingContext.previous.id, title: writingContext.previous.title, content: writingContext.previous.content }] : [],
+          memories: writingContext.previousMemory ? [writingContext.previousMemory] : [],
+          memoryDocuments: writingContext.earlierMemorySummary ? [writingContext.earlierMemorySummary] : [],
+          writingStyle: writingContext.activeStyle ? { name: writingContext.activeStyle.name, content: writingContext.activeStyle.content } : undefined,
+          skills: writingContext.skillPayload, preferredSkillNames: writingContext.preferredSkillNames,
+          authorPreferences: target.authorPreferences || [],
           apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
@@ -2964,11 +3019,25 @@ function App() {
     }
     try {
       const style = target.styleProfileId ? writingStyles.find(item => item.id === target.styleProfileId) : undefined;
+      const targetChapter = target.chapters.find(item => chapterNumberFromText(item.title) === chapter.number)
+        || { id: -Math.max(1, chapter.number), title: `第${chapter.number}章`, content: '', wordCount: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+      const outlineText = [chapter.detailedOutline, chapter.summary, chapter.characterDynamics.join('；')].filter(Boolean).join('\n');
+      const writingContext = buildWritingContext(target, targetChapter, '根据拆书章纲生成目标作品正文', outlineText);
       const result = await invoke<{ title?: string; content?: string }>('call_agent_rpc', {
         method: 'book.adapt',
         params: {
           projectTitle: target.title, projectSynopsis: target.synopsis, projectOutlines: target.outlines.map(outline => `## ${outline.kind}\n${outline.content}`).join('\n\n'),
           chapterTitle: chapter.title, detailedOutline: chapter.detailedOutline, rewriteContent: chapter.rewriteContent, styleProfile: style?.content,
+          targetProjectTitle: target.title, targetProjectSynopsis: target.synopsis,
+          targetProjectOutlines: target.outlines.map(outline => ({ id: outline.id, kind: outline.kind, title: outline.title, chapterId: outline.chapterId, content: outline.content })),
+          targetWorldSetting: target.outlines.filter(outline => outline.kind === '世界观与作品设定').map(outline => ({ id: outline.id, title: outline.title, content: outline.content })),
+          cards: writingContext.cards, knowledgeGraph: { nodes: target.graphNodes, edges: target.graphEdges },
+          previousChapters: writingContext.previous ? [{ id: writingContext.previous.id, title: writingContext.previous.title, content: writingContext.previous.content }] : [],
+          memories: writingContext.previousMemory ? [writingContext.previousMemory] : [],
+          memoryDocuments: writingContext.earlierMemorySummary ? [writingContext.earlierMemorySummary] : [],
+          writingStyle: writingContext.activeStyle ? { name: writingContext.activeStyle.name, content: writingContext.activeStyle.content } : undefined,
+          skills: writingContext.skillPayload, preferredSkillNames: writingContext.preferredSkillNames,
+          authorPreferences: target.authorPreferences || [],
           apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
@@ -3791,17 +3860,66 @@ function App() {
   // stable names/aliases occur in the current task or immediate chapter context.
   // Sending only compact card headers/content keeps the upstream prompt prefix
   // stable and avoids requiring a manual picker for every chapter.
-  const rankCardsForChapter = (project: Project, chapter: Chapter | null, instruction: string, outlineText: string, previousMemory?: ChapterMemory) => {
+  const rankCardsForChapter = (project: Project, chapter: Chapter | null, instruction: string, outlineText: string, previousMemory?: ChapterMemory, explicitIds: number[] = selectedCardIds) => {
     const query = [chapter?.title || '', chapter?.content || '', instruction, outlineText, previousMemory?.summary || '', ...(previousMemory?.keywords || [])].join('\n').toLocaleLowerCase();
-    return project.cards.map(card => {
+    const ranked = project.cards.map(card => {
       const terms = cardSearchTerms(card);
       const title = card.title.trim().toLocaleLowerCase();
       const titleHit = title.length >= 2 && query.includes(title) ? 80 : 0;
       const termHits = terms.slice(0, 12).reduce((score, term) => score + (term.length >= 3 && query.includes(term.toLocaleLowerCase()) ? (term === card.title ? 24 : 4) : 0), 0);
-      const explicit = selectedCardIds.includes(card.id) ? 1000 : 0;
-      const typeBoost = /角色卡|地点卡|势力卡/u.test(card.type) ? 3 : 0;
+      const explicit = explicitIds.includes(card.id) ? 1000 : 0;
+      // Core continuity cards must remain available even when a dismantled
+      // outline uses reference-work names instead of the target novel's names.
+      // Semantic hits still outrank this baseline, while protagonist and
+      // golden-finger cards are never silently dropped from automatic retrieval.
+      const typeBoost = card.type === '角色卡' ? 18 : card.type === '金手指卡' ? 14 : /地点卡|势力卡/u.test(card.type) ? 3 : 0;
       return { card, score: explicit + titleHit + termHits + typeBoost };
-    }).filter(item => item.score > 0).sort((left, right) => right.score - left.score || left.card.id - right.card.id).slice(0, 10).map(item => item.card);
+    }).filter(item => item.score > 0).sort((left, right) => right.score - left.score || left.card.id - right.card.id);
+    const selected = ranked.slice(0, 10).map(item => item.card);
+    const core = project.cards.filter(card => card.type === '金手指卡' || (/角色卡/u.test(card.type) && /主角|主人公|男主|女主/u.test(`${card.title}\n${card.content}`)));
+    const coreIds = new Set(core.map(card => card.id));
+    for (const card of core) {
+      if (!selected.some(item => item.id === card.id)) {
+        if (selected.length < 10) selected.push(card);
+        else {
+          const removableIndex = selected.findIndex(item => !coreIds.has(item.id));
+          if (removableIndex < 0) break;
+          selected.splice(removableIndex, 1, card);
+        }
+      }
+    }
+    return selected.filter((card, index, list) => list.findIndex(item => item.id === card.id) === index);
+  };
+
+  const buildWritingContext = (project: Project, chapter: Chapter, instruction: string, outlineText: string) => {
+    const currentIndex = project.chapters.findIndex(item => item.id === chapter.id);
+    // A dismantled chapter is usually a new target chapter, so its immediate
+    // predecessor is the last existing chapter even though the placeholder is
+    // not in project.chapters yet.
+    const continuityIndex = currentIndex >= 0 ? currentIndex : project.chapters.length;
+    const previous = continuityIndex > 0 ? project.chapters[continuityIndex - 1] : undefined;
+    const previousMemory = previous ? project.memories.find(memory => memory.chapterId === previous.id) : undefined;
+    const explicitCardIds = project.id === editingProject?.id ? selectedCardIds : [];
+    const autoMatchedCards = rankCardsForChapter(project, chapter, instruction, outlineText, previousMemory, explicitCardIds);
+    const resolvedCardIds = Array.from(new Set([...explicitCardIds, ...autoMatchedCards.map(card => card.id)]));
+    const activeStyle = project.styleProfileId ? writingStyles.find(style => style.id === project.styleProfileId) : undefined;
+    const earlierSource = currentIndex >= 0 ? chapter : project.chapters[project.chapters.length - 1];
+    const earlierMemorySummary = earlierSource
+      ? buildEarlierMemorySummary(project, earlierSource, agentConfig.memorySummaryChapterCount)
+      : undefined;
+    const skillPayload = skills.map(skill => ({
+      name: skill.name, displayName: skill.displayName, category: skill.category,
+      description: skill.description, tags: skill.tags, content: skill.content,
+    }));
+    return {
+      previous,
+      previousMemory,
+      earlierMemorySummary,
+      activeStyle,
+      cards: project.cards.filter(card => resolvedCardIds.includes(card.id)).sort((left, right) => left.id - right.id).slice(0, 10),
+      skillPayload,
+      preferredSkillNames: selectedAgentSkillNames.filter(name => skillPayload.some(skill => skill.name === name)),
+    };
   };
 
   const buildEarlierMemorySummary = (project: Project, currentChapter: Chapter, count: number): MemoryDocument | undefined => {
@@ -4587,20 +4705,33 @@ function App() {
     }
   };
 
-  const generateBatchChapters = async (project: Project, requestedCount: number) => {
+  const generateBatchChapters = async (project: Project, requestedCount: number, options?: { resumeFromChapter?: number }) => {
     if (batchGenerationRunning) return;
     if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写可用 API Key，再批量生成章节。' });
       return;
     }
     const count = Math.max(1, Math.min(20, Math.floor(requestedCount)));
+    const startChapterNumber = project.chapters.length + 1;
+    if (options?.resumeFromChapter && options.resumeFromChapter !== startChapterNumber) {
+      setNotice({ title: '断点已变化', content: `当前作品下一章是第 ${startChapterNumber} 章，无法从第 ${options.resumeFromChapter} 章继续，请重新开始批量生成。` });
+      return;
+    }
     setBatchGenerationRunning(true);
-    setBatchGenerationProgress(`准备生成 ${count} 章`);
-    setBatchGenerationItems(Array.from({ length: count }, (_, index) => ({
-      chapterNumber: project.chapters.length + index + 1,
-      title: `第 ${project.chapters.length + index + 1} 章`,
-      status: 'pending' as const,
-    })));
+    setBatchGenerationProgress(options?.resumeFromChapter ? `从第 ${options.resumeFromChapter} 章继续生成，共 ${count} 章` : `准备生成 ${count} 章`);
+    setBatchGenerationItems(current => {
+      if (!options?.resumeFromChapter || !current.length) {
+        return Array.from({ length: count }, (_, index) => ({
+          chapterNumber: project.chapters.length + index + 1,
+          title: `第 ${project.chapters.length + index + 1} 章`,
+          status: 'pending' as const,
+        }));
+      }
+      const resumeEnd = options.resumeFromChapter + count - 1;
+      return current.map(item => item.chapterNumber >= options.resumeFromChapter && item.chapterNumber <= resumeEnd
+        ? { ...item, title: item.title || `第 ${item.chapterNumber} 章`, status: 'pending' as const, outline: undefined, content: undefined, memory: undefined }
+        : item);
+    });
     let working = project;
     let projectSnapshot = projects;
     const activeStyle = working.styleProfileId ? writingStyles.find(style => style.id === working.styleProfileId) : undefined;
@@ -4728,6 +4859,23 @@ function App() {
       setBatchGenerationRunning(false);
       setBatchGenerationProgress('');
     }
+  };
+
+  const resumeBatchGeneration = (project: Project) => {
+    if (batchGenerationRunning) return;
+    const failedItem = batchGenerationItems.find(item => item.status === 'error');
+    if (!failedItem) {
+      setNotice({ title: '没有可继续的任务', content: '当前批量生成没有失败章节。' });
+      return;
+    }
+    const nextChapterNumber = project.chapters.length + 1;
+    if (failedItem.chapterNumber !== nextChapterNumber) {
+      setNotice({ title: '断点已变化', content: `当前作品下一章是第 ${nextChapterNumber} 章，失败记录从第 ${failedItem.chapterNumber} 章开始，请重新生成。` });
+      return;
+    }
+    const remainingCount = Math.max(1, batchGenerationItems.filter(item => item.chapterNumber >= failedItem.chapterNumber).length);
+    setBatchGenerationCount(String(remainingCount));
+    void generateBatchChapters(project, remainingCount, { resumeFromChapter: failedItem.chapterNumber });
   };
 
   const startNewCard = () => {
@@ -4950,11 +5098,9 @@ function App() {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写 API Saver Key，再运行审查中心。' });
       return;
     }
-    const chapters = reviewScope === 'chapter'
-      ? (activeChapter ? [activeChapter] : [])
-      : reviewScope === 'selected'
-        ? editingProject.chapters.filter(chapter => selectedReviewChapterIds.includes(chapter.id))
-        : editingProject.chapters;
+    const chapters = reviewScope === 'selected'
+      ? editingProject.chapters.filter(chapter => selectedReviewChapterIds.includes(chapter.id))
+      : editingProject.chapters;
     if (!chapters.length) {
       setNotice({ title: '请选择章节', content: '选择至少一个章节后再开始审查。' });
       return;
@@ -4988,6 +5134,8 @@ function App() {
       const nextProjects = projectsRef.current.map(item => item.id === updated.id ? updated : item);
       projectsRef.current = nextProjects;
       setEditingProject(updated); setProjects(nextProjects);
+      setReviewActiveChapterId(results[0]?.chapterId ?? null);
+      setReviewSidebarPage('reports');
       if ('__TAURI_INTERNALS__' in window) await invoke<string>('save_projects', { projects: nextProjects });
       else localStorage.setItem('projects', JSON.stringify(nextProjects));
       setNotice({ title: '审查完成', content: `已完成 ${results.length} 章审查，可按建议让 AI 修改并保存。` });
@@ -5033,20 +5181,27 @@ function App() {
     }
   };
 
-  const applyReviewSuggestions = async (chapterId: number) => {
-    if (!editingProject || reviewApplyingChapterId !== null) return;
+  const applyReviewIssue = async (chapterId: number, issueIndex: number) => {
+    if (!editingProject || reviewApplyingIssueKey !== null) return;
+    const key = `${chapterId}:${issueIndex}`;
     const report = editingProject.reviewCenter?.chapters.find(item => item.chapterId === chapterId);
+    const issue = report?.issues[issueIndex];
     const chapter = editingProject.chapters.find(item => item.id === chapterId);
-    if (!report || !chapter) return;
-    setReviewApplyingChapterId(chapterId);
+    if (!report || !issue || !chapter || issue.applied) return;
+    setReviewApplyingIssueKey(key);
+    setReviewActiveChapterId(chapterId);
     try {
       await invoke<string>('start_agent_runtime');
-      const advice = [...report.issues.map(issue => `${issue.category}：${issue.suggestion}`), ...report.suggestions].filter(Boolean).join('\n');
+      const outline = getChapterOutline(editingProject, chapter) || outlineByChapterNumber(editingProject, chapterNumberFromText(chapter.title));
       const result = await invoke<{ content?: string }>('call_agent_rpc', {
         method: 'text.transform',
         params: {
           mode: 'polish', projectTitle: editingProject.title, chapterTitle: chapter.title, content: chapter.content,
-          instruction: `根据以下审查建议修改本章。保持已发生的剧情、人物、时间线、设定和叙事视角，不新增未证实事件；只修复建议涉及的问题，直接输出完整章节正文，不要标题、JSON或解释。\n${advice}`,
+          instruction: `只处理下面这一条审查建议，保持原剧情、人物、时间线、设定、叙事视角和章节标题不变。不要处理其他问题，不新增未证实事件，直接输出完整章节正文，不要标题、JSON或解释。
+问题分类：${issue.category}
+正文证据：${issue.evidence}
+修改建议：${issue.suggestion}
+对应章纲：${compactText(outline?.content || '暂无章纲', 5000)}`,
           apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim(), model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow,
           ...agentNetworkParams(agentConfig),
         },
@@ -5059,18 +5214,26 @@ function App() {
       const latestChapter = latestProject.chapters.find(item => item.id === chapterId) || chapter;
       const chapterToSave = { ...latestChapter, ...updatedChapter };
       const withMemory = buildProjectWithChapterMemory(latestProject, chapterToSave, buildLocalStructuredMemory(chapterToSave, latestProject));
-      const updated = { ...withMemory, updatedAt: now };
+      const latestReport = withMemory.reviewCenter || latestProject.reviewCenter;
+      const updatedReport = latestReport ? {
+        ...latestReport,
+        chapters: latestReport.chapters.map(item => item.chapterId === chapterId
+          ? { ...item, issues: item.issues.map((entry, index) => index === issueIndex ? { ...entry, applied: true } : entry) }
+          : item),
+        updatedAt: now,
+      } : undefined;
+      const updated = { ...withMemory, ...(updatedReport ? { reviewCenter: updatedReport } : {}), updatedAt: now };
       const nextProjects = projectsRef.current.map(item => item.id === updated.id ? updated : item);
       projectsRef.current = nextProjects;
       setEditingProject(updated); setActiveChapter(current => current?.id === chapterId ? chapterToSave : current); setProjects(nextProjects);
       if ('__TAURI_INTERNALS__' in window) await invoke<string>('save_projects', { projects: nextProjects });
       else localStorage.setItem('projects', JSON.stringify(nextProjects));
       void syncChapterOutlineOnSave(updated, chapterToSave);
-      setNotice({ title: '章节已按建议修改', content: `${chapter.title} 已保存，正在后台同步对应章纲。` });
+      setNotice({ title: '建议已应用', content: `${chapter.title} 的“${issue.category}”建议已修改并保存，其他建议保持不变。` });
     } catch (error) {
-      setNotice({ title: '修改失败', content: String(error) });
+      setNotice({ title: '应用建议失败', content: String(error) });
     } finally {
-      setReviewApplyingChapterId(null);
+      setReviewApplyingIssueKey(null);
     }
   };
 
@@ -6108,7 +6271,7 @@ function App() {
             </div>
           )}
 
-          <div className="editor-body">
+          <div className={`editor-body ${editorSidebarTab === 'review' ? 'review-editor-body' : ''}`}>
             <aside className="editor-sidebar">
               <div className="editor-sidebar-tabs">
                 <button
@@ -6167,9 +6330,21 @@ function App() {
                 </button>
                 <button
                   className={editorSidebarTab === 'review' ? 'active' : ''}
-                  onClick={() => setEditorSidebarTab('review')}
+                  onClick={() => {
+                    setEditorSidebarTab('review');
+                    setReviewScope('selected');
+                    setReviewSidebarPage('home');
+                    setSelectedReviewChapterIds(current => current.length ? current : editingProject.chapters.map(chapter => chapter.id));
+                    setReviewActiveChapterId(current => current ?? editingProject.reviewCenter?.chapters[0]?.chapterId ?? null);
+                  }}
                 >
                   审查中心
+                </button>
+                <button
+                  className={editorSidebarTab === 'export' ? 'active' : ''}
+                  onClick={() => setEditorSidebarTab('export')}
+                >
+                  导出
                 </button>
               </div>
               <div className="batch-generation-sidebar-entry">
@@ -6188,16 +6363,45 @@ function App() {
 
               {editorSidebarTab === 'review' && (() => {
                 const report = editingProject.reviewCenter;
-                return <div className="review-center-panel">
-                  <div className="panel-section-title">审查中心 <span>一致性与可读性</span></div>
-                  <p className="review-center-intro">检查章节与章纲、人物卡、时间线和伏笔的一致性；完成后可按建议直接修改正文。</p>
-                  <div className="review-scope-tabs"><button className={reviewScope === 'chapter' ? 'active' : ''} onClick={() => setReviewScope('chapter')}>当前章</button><button className={reviewScope === 'selected' ? 'active' : ''} onClick={() => setReviewScope('selected')}>选择章节</button><button className={reviewScope === 'book' ? 'active' : ''} onClick={() => setReviewScope('book')}>全书</button></div>
-                  {reviewScope === 'selected' && <div className="review-chapter-picker">{editingProject.chapters.map(chapter => <label key={chapter.id}><input type="checkbox" checked={selectedReviewChapterIds.includes(chapter.id)} onChange={() => setSelectedReviewChapterIds(current => current.includes(chapter.id) ? current.filter(id => id !== chapter.id) : [...current, chapter.id])} /><span>{chapter.title}</span></label>)}</div>}
-                  <button className="btn-primary" disabled={reviewRunning} onClick={() => void runReviewCenter()}>{reviewRunning ? '审查中...' : '开始审查'}</button>
-                  <button className="btn-secondary review-export-button" disabled={chapterExportRunning || !editingProject.chapters.length} onClick={() => void exportAllChaptersTxt()}>{chapterExportRunning ? '导出全部章节中...' : '导出全部章节 TXT'}</button>
-                  {report?.chapters?.length ? <div className="review-result-list">{report.chapters.map(item => <article className="review-result-card" key={item.chapterId}><header><div><strong>{item.chapterTitle}</strong><small>{item.reviewedAt ? new Date(item.reviewedAt).toLocaleString() : ''}</small></div><b className={item.score >= 85 ? 'good' : item.score >= 60 ? 'warn' : 'bad'}>{item.score} 分</b></header><p>{item.summary}</p>{item.issues.length ? <div className="review-issue-list">{item.issues.map((issue, index) => <div className={`review-issue ${issue.severity}`} key={`${item.chapterId}-${index}`}><strong>{issue.category}</strong><span>{issue.evidence}</span><p>{issue.suggestion}</p></div>)}</div> : <small className="review-clean">未发现明确冲突</small>}<button className="btn-secondary" disabled={reviewApplyingChapterId === item.chapterId} onClick={() => void applyReviewSuggestions(item.chapterId)}>{reviewApplyingChapterId === item.chapterId ? '修改并保存中...' : '按建议修改并保存'}</button></article>)}</div> : <p className="empty-hint compact">选择范围后开始审查，报告会保存在当前作品。</p>}
+                const reportChapterCount = report?.chapters.length || 0;
+                const renderChapterPicker = () => <div className="review-chapter-picker"><div className="review-picker-toolbar"><strong>选择要审查的章节</strong><span>{selectedReviewChapterIds.length} / {editingProject.chapters.length} 已选</span><div><button type="button" className="link-button" onClick={() => setSelectedReviewChapterIds(editingProject.chapters.map(chapter => chapter.id))}>全选</button><button type="button" className="link-button" onClick={() => setSelectedReviewChapterIds([])}>清空</button></div></div>{editingProject.chapters.length ? editingProject.chapters.map((chapter, index) => <label className={`review-chapter-option ${selectedReviewChapterIds.includes(chapter.id) ? 'selected' : ''}`} key={chapter.id}><input type="checkbox" checked={selectedReviewChapterIds.includes(chapter.id)} onChange={() => setSelectedReviewChapterIds(current => current.includes(chapter.id) ? current.filter(id => id !== chapter.id) : [...current, chapter.id])} /><span><strong>{chapter.title || `第 ${index + 1} 章`}</strong><small>{chapter.wordCount.toLocaleString()} 字</small></span></label>) : <p className="empty-hint compact">当前作品还没有章节。</p>}</div>;
+                const renderReportNav = () => <div className="review-chapter-nav">{editingProject.chapters.map(chapter => {
+                  const item = report?.chapters.find(result => result.chapterId === chapter.id);
+                  const pendingCount = item?.issues.filter(issue => !issue.applied).length || 0;
+                  return <button type="button" className={(reviewActiveChapterId ?? report?.chapters[0]?.chapterId ?? editingProject.chapters[0]?.id) === chapter.id ? 'active' : ''} key={chapter.id} onClick={() => { setReviewActiveChapterId(chapter.id); setActiveChapter(chapter); }}><span><strong>{chapter.title}</strong><small>{item ? (pendingCount ? `${pendingCount} 条待处理` : '问题已处理') + ` · ${item.score} 分` : '尚未审查'}</small></span>{item ? <b className={item.score >= 85 ? 'good' : item.score >= 60 ? 'warn' : 'bad'}>{item.score}</b> : <b className="unreviewed">·</b>}</button>;
+                })}</div>;
+                return <div className={`review-center-panel review-sidebar-panel review-page-${reviewSidebarPage}`}>
+                  {reviewSidebarPage === 'home' && <>
+                    <div className="panel-section-title">审查中心 <span>一致性与可读性</span></div>
+                    <p className="review-center-intro">选择审查范围并开始检查，详细报告会在中间工作区展示。</p>
+                    <div className="review-scope-tabs"><button className={reviewScope === 'selected' ? 'active' : ''} onClick={() => { setReviewScope('selected'); setReviewSidebarPage('chapters'); }}>选择章节 <small>{selectedReviewChapterIds.length} 章</small></button><button className={reviewScope === 'book' ? 'active' : ''} onClick={() => { setReviewScope('book'); setReviewSidebarPage('home'); }}>全书 <small>{editingProject.chapters.length} 章</small></button></div>
+                    <div className="review-home-actions"><button type="button" className="btn-primary" disabled={reviewRunning} onClick={() => void runReviewCenter()}>{reviewRunning ? '审查中...' : reviewScope === 'book' ? '开始审查全书' : '开始审查已选章节'}</button>{reportChapterCount > 0 && <button type="button" className="btn-secondary" onClick={() => setReviewSidebarPage('reports')}>查看审查报告 <span>{reportChapterCount} 章</span></button>}</div>
+                    {!report && <p className="empty-hint compact">选择“选择章节”进入章节目录，或直接审查全书。</p>}
+                  </>}
+                  {reviewSidebarPage === 'chapters' && <>
+                    <button type="button" className="review-back-button" onClick={() => setReviewSidebarPage('home')}>‹ 返回审查中心</button>
+                    <div className="review-subpage-heading"><strong>选择审查章节</strong><span>{selectedReviewChapterIds.length} / {editingProject.chapters.length} 已选</span></div>
+                    {renderChapterPicker()}
+                    <button className="btn-primary" disabled={reviewRunning} onClick={() => void runReviewCenter()}>{reviewRunning ? '审查中...' : '开始审查已选章节'}</button>
+                  </>}
+                  {reviewSidebarPage === 'reports' && <>
+                    <button type="button" className="review-back-button" onClick={() => setReviewSidebarPage('home')}>‹ 返回审查中心</button>
+                    <div className="review-subpage-heading"><strong>审查报告</strong><span>{reportChapterCount} 章</span></div>
+                    {report ? renderReportNav() : <p className="empty-hint compact">还没有审查报告。</p>}
+                  </>}
                 </div>;
               })()}
+
+              {editorSidebarTab === 'export' && (
+                <div className="review-center-panel export-panel">
+                  <div className="panel-section-title">导出 <span>小说文件</span></div>
+                  <p className="review-center-intro">将当前作品的全部章节导出为 TXT 文件，包含章节标题和正文内容。</p>
+                  <button className="btn-primary" disabled={chapterExportRunning || !editingProject.chapters.length} onClick={() => void exportAllChaptersTxt()}>
+                    {chapterExportRunning ? '导出全部章节中...' : '导出全部章节 TXT'}
+                  </button>
+                  {!editingProject.chapters.length && <p className="empty-hint compact">当前作品还没有章节可导出。</p>}
+                </div>
+              )}
 
               {editorSidebarTab === 'ai-detect' && (() => {
                 const report = editingProject.aiDetection;
@@ -6402,7 +6606,28 @@ function App() {
             </aside>
 
             <main className="editor-main">
-              {editorSidebarTab === 'search' ? (
+              {editorSidebarTab === 'review' ? (() => {
+                const report = editingProject.reviewCenter;
+                const selectedReportChapterId = reviewActiveChapterId ?? report?.chapters[0]?.chapterId ?? activeChapter?.id ?? null;
+                const selectedReport = report?.chapters.find(item => item.chapterId === selectedReportChapterId) || null;
+                return <section className="review-workspace" aria-label="审查中心工作区">
+                  <header className="review-workspace-header">
+                    <div><span>一致性与可读性</span><h3>审查中心</h3><p>逐条查看证据与修改建议，只应用你确认的条目。</p></div>
+                    {report && <small>更新于 {new Date(report.updatedAt).toLocaleString()}</small>}
+                  </header>
+                  {!report ? <div className="review-workspace-empty"><strong>还没有审查报告</strong><span>在左侧选择范围并点击“开始审查”，详细结果会显示在这里。</span></div> : <div className="review-workspace-content">
+                    <nav className="review-report-chapter-strip" aria-label="审查报告章节"><span>审查章节</span>{editingProject.chapters.map(chapter => { const item = report.chapters.find(result => result.chapterId === chapter.id); return <button type="button" className={(selectedReportChapterId === chapter.id) ? 'active' : ''} key={chapter.id} onClick={() => { setReviewActiveChapterId(chapter.id); setActiveChapter(chapter); }}>{chapter.title}{item ? '' : ' · 未审查'}</button>; })}</nav>
+                    {!selectedReport ? <div className="review-workspace-empty"><strong>本章尚未审查</strong><span>在左侧勾选本章后点击“开始审查”，结果会保存在当前作品。</span></div> : <>
+                      <div className="review-report-heading"><div><span>当前报告</span><h4>{selectedReport.chapterTitle}</h4><p>{selectedReport.summary}</p></div><b className={selectedReport.score >= 85 ? 'good' : selectedReport.score >= 60 ? 'warn' : 'bad'}>{selectedReport.score} 分</b></div>
+                      {selectedReport.issues.length ? <div className="review-workspace-issues"><div className="review-section-heading"><strong>发现的问题</strong><span>{selectedReport.issues.filter(issue => !issue.applied).length} 条待处理</span></div>{selectedReport.issues.map((issue, index) => {
+                        const issueKey = `${selectedReport.chapterId}:${index}`;
+                        return <article className={`review-workspace-issue ${issue.severity} ${issue.applied ? 'applied' : ''}`} key={issueKey}><div className="review-issue-heading"><div><span className="review-issue-severity">{issue.severity === 'high' ? '高优先级' : issue.severity === 'low' ? '低优先级' : '中优先级'}</span><strong>{issue.category}</strong></div><button type="button" className="btn-secondary review-issue-apply" disabled={issue.applied || reviewApplyingIssueKey !== null} onClick={() => void applyReviewIssue(selectedReport.chapterId, index)}>{issue.applied ? '已应用' : reviewApplyingIssueKey === issueKey ? '修改保存中...' : '应用此条建议'}</button></div><div className="review-issue-evidence"><span>正文证据</span><p>{issue.evidence || '审查器未提供原文证据。'}</p></div><div className="review-issue-suggestion"><span>修改建议</span><p>{issue.suggestion || '暂无可执行建议。'}</p></div></article>;
+                      })}</div> : <div className="review-clean-state"><strong>本章未发现明确问题</strong><span>可以切换上方或左侧其他章节继续查看。</span></div>}
+                      {selectedReport.suggestions.length > 0 && <div className="review-general-suggestions"><div className="review-section-heading"><strong>整体建议</strong><span>仅供参考</span></div><ul>{selectedReport.suggestions.map((suggestion, index) => <li key={`${selectedReport.chapterId}-suggestion-${index}`}>{suggestion}</li>)}</ul></div>}
+                    </>}
+                  </div>}
+                </section>;
+              })() : editorSidebarTab === 'search' ? (
                 <section className="project-search-workspace" aria-label="剧情搜索">
                   <header className="project-search-header">
                     <div>
@@ -6942,13 +7167,14 @@ function App() {
             {dismantleBooks.length === 0 ? <div className="dismantle-empty"><div className="dismantle-empty-mark">拆</div><h3>还没有拆书资料</h3><p>请先在书籍管理下载小说，再选择“加入拆书管理”。</p><button className="btn-primary" onClick={() => setActiveTab('books')}>选择本地书籍</button></div> : <div className="dismantle-workspace">
               <aside className="dismantle-library">
                 <div className="dismantle-library-heading"><div><strong>拆书书库</strong><small>{dismantleBooks.length} 部作品</small></div><button className="link-button" onClick={() => setActiveTab('books')}>选择书籍</button></div>
-                <div className="dismantle-book-list">{dismantleBooks.map(book => <button type="button" key={book.id} className={`dismantle-book-item ${book.id === activeDismantleBookId ? 'active' : ''}`} onClick={() => { setActiveDismantleBookId(book.id); setActiveDismantleChapterId(book.chapters[0]?.id || null); setSelectedDismantleChapterIds(book.chapters.slice(0, 1).map(chapter => chapter.id)); }}><div><strong>{book.title}</strong><small>{book.chapters.length} 章 · {book.chapters.filter(chapter => chapter.status === 'analyzed' || chapter.status === 'rewritten').length} 章已分析</small>{book.boundProjectId && <em>已绑定小说</em>}</div></button>)}</div>
+                <div className="dismantle-book-list">{dismantleBooks.map(book => <button type="button" key={book.id} className={`dismantle-book-item ${book.id === activeDismantleBookId ? 'active' : ''}`} onClick={() => { setActiveDismantleBookId(book.id); setActiveDismantleChapterId(book.chapters[0]?.id || null); setSelectedDismantleChapterIds(book.chapters.filter(chapter => chapter.status === 'pending' || chapter.status === 'failed').map(chapter => chapter.id)); }}><div><strong>{book.title}</strong><small>{book.chapters.length} 章 · {book.chapters.filter(chapter => chapter.status === 'analyzed' || chapter.status === 'rewritten').length} 章已分析</small>{book.boundProjectId && <em>已绑定小说</em>}</div></button>)}</div>
               </aside>
               {activeDismantleBook && <section className="dismantle-detail">
                 <header className="dismantle-detail-header"><div><span>拆书资料</span><h3>{activeDismantleBook.title}</h3><small>{activeDismantleBook.chapters.length} 章 · {activeDismantleBook.chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0).toLocaleString()} 字</small></div><div className="dismantle-detail-actions"><button className="link-button" onClick={() => void invoke<string>('open_dismantle_location', { bookTitle: activeDismantleBook.title }).catch(error => setNotice({ title: '打开拆书位置失败', content: String(error) }))}>打开位置</button><button className="link-button danger-link" onClick={() => void deleteDismantleBook(activeDismantleBook)}>删除</button></div></header>
-                <div className="dismantle-detail-toolbar"><label>绑定目标小说<select className="select" value={activeDismantleBook.boundProjectId?.toString() || ''} onChange={event => bindDismantleToProject(activeDismantleBook.id, event.target.value ? Number(event.target.value) : undefined)}><option value="">暂不绑定</option>{projects.map(project => <option key={project.id} value={project.id}>{project.title}</option>)}</select></label><button className="btn-secondary" onClick={() => startDismantleImitation(activeDismantleBook)}>一键仿写此书</button><button className="btn-secondary" disabled={styleDistilling} onClick={() => void distillDismantleStyle()}>{styleDistilling ? '蒸馏中...' : '蒸馏文风 Skill'}</button><button className="btn-primary" disabled={Boolean(dismantleRunningIds.length)} onClick={() => void runDismantleAnalysis()}>{dismantleRunningIds.length ? `分析中 ${dismantleRunningIds.length} 章` : `生成选中章纲（${selectedDismantleChapterIds.length}）`}</button></div>
+                <div className="dismantle-detail-toolbar"><label>绑定目标小说<select className="select" value={activeDismantleBook.boundProjectId?.toString() || ''} onChange={event => bindDismantleToProject(activeDismantleBook.id, event.target.value ? Number(event.target.value) : undefined)}><option value="">暂不绑定</option>{projects.map(project => <option key={project.id} value={project.id}>{project.title}</option>)}</select></label><button className="btn-secondary" onClick={() => startDismantleImitation(activeDismantleBook)}>一键仿写此书</button><button className="btn-secondary" disabled={styleDistilling} onClick={() => void distillDismantleStyle()}>{styleDistilling ? '蒸馏中...' : '蒸馏文风 Skill'}</button><button className="btn-secondary" disabled={Boolean(dismantleRunningIds.length)} onClick={continueDismantleAnalysis}>继续拆书</button><button className="btn-primary" disabled={Boolean(dismantleRunningIds.length)} onClick={() => void runDismantleAnalysis()}>{dismantleRunningIds.length ? `分析中 ${dismantleRunningIds.length} 章` : `生成选中章纲（${selectedDismantleChapterIds.length}）`}</button></div>
+                {dismantleProgress.bookId === activeDismantleBook.id && dismantleProgress.total > 0 && <div className="dismantle-progress" role="status"><span>拆书进度：{dismantleProgress.completed}/{dismantleProgress.total} 章</span>{dismantleProgress.current && <span>当前第 {dismantleProgress.current} 章</span>}{dismantleProgress.failed && <strong>第 {dismantleProgress.failed} 章失败，可继续拆书</strong>}</div>}
                 <div className="dismantle-detail-body">
-                  <div className="dismantle-chapter-list"><div className="dismantle-list-heading"><strong>章节选择</strong><button className="link-button" onClick={() => setSelectedDismantleChapterIds(activeDismantleBook.chapters.map(chapter => chapter.id))}>全选</button><button className="link-button" onClick={() => setSelectedDismantleChapterIds([])}>清空</button></div>{activeDismantleBook.chapters.map(chapter => <label key={chapter.id} className={`dismantle-chapter-row ${chapter.id === activeDismantleChapterId ? 'active' : ''}`}><input type="checkbox" checked={selectedDismantleChapterIds.includes(chapter.id)} onChange={() => setSelectedDismantleChapterIds(current => current.includes(chapter.id) ? current.filter(id => id !== chapter.id) : [...current, chapter.id])} /><button type="button" onClick={() => setActiveDismantleChapterId(chapter.id)}><strong>第 {chapter.number} 章</strong><span>{chapter.title}</span><small>{chapter.wordCount.toLocaleString()} 字 · {chapter.status === 'rewritten' ? '已改写' : chapter.status === 'analyzed' ? '已分析' : chapter.status === 'analyzing' ? '分析中' : '待分析'}</small></button></label>)}</div>
+                  <div className="dismantle-chapter-list"><div className="dismantle-list-heading"><strong>章节选择</strong><button className="link-button" onClick={() => setSelectedDismantleChapterIds(activeDismantleBook.chapters.filter(chapter => chapter.status !== 'analyzed' && chapter.status !== 'rewritten').map(chapter => chapter.id))}>全选待分析</button><button className="link-button" onClick={() => setSelectedDismantleChapterIds([])}>清空</button></div>{activeDismantleBook.chapters.map(chapter => <label key={chapter.id} className={`dismantle-chapter-row ${chapter.id === activeDismantleChapterId ? 'active' : ''}`}><input type="checkbox" checked={selectedDismantleChapterIds.includes(chapter.id)} onChange={() => setSelectedDismantleChapterIds(current => current.includes(chapter.id) ? current.filter(id => id !== chapter.id) : [...current, chapter.id])} /><button type="button" onClick={() => setActiveDismantleChapterId(chapter.id)}><strong>第 {chapter.number} 章</strong><span>{chapter.title}</span><small>{chapter.wordCount.toLocaleString()} 字 · {chapter.status === 'rewritten' ? '已改写' : chapter.status === 'analyzed' ? '已分析' : chapter.status === 'analyzing' ? '分析中' : chapter.status === 'failed' ? '失败，可重试' : '待分析'}</small></button></label>)}</div>
                   {activeDismantleChapter && <article className="dismantle-chapter-editor"><div className="dismantle-chapter-heading"><div><span>第 {activeDismantleChapter.number} 章</span><h4>{activeDismantleChapter.title}</h4></div><button className="btn-secondary" onClick={() => void runDismantleRewrite()} disabled={dismantleRewriteRunning || !activeDismantleChapter.detailedOutline.trim()}>{dismantleRewriteRunning ? '原创生成中...' : '根据章纲生成原创稿'}</button></div><div className="dismantle-analysis-grid"><div><strong>剧情摘要</strong><textarea value={activeDismantleChapter.summary} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, summary: event.target.value, updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="分析后显示剧情摘要" /></div><div><strong>节奏判断</strong><textarea value={activeDismantleChapter.pacing} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, pacing: event.target.value, updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="开场、发展、转折、收束" /></div></div><label className="dismantle-outline-field"><strong>章节细纲（可人工修改）</strong><textarea value={activeDismantleChapter.detailedOutline} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, detailedOutline: event.target.value, status: event.target.value.trim() ? 'analyzed' : 'pending', updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="选择章节后点击生成章纲" /></label><details className="dismantle-source-details"><summary>查看原文（只读）</summary><pre>{activeDismantleChapter.sourceContent}</pre></details><label className="dismantle-outline-field"><strong>原创改写稿（确认前可编辑）</strong><textarea value={activeDismantleChapter.rewriteContent} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, rewriteContent: event.target.value, status: event.target.value.trim() ? 'rewritten' : item.detailedOutline.trim() ? 'analyzed' : 'pending', updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="AI 生成后可人工修改，确认后生成到目标小说" /></label><div className="dismantle-rewrite-footer"><input className="input" value={dismantleRewriteInstruction} onChange={event => setDismantleRewriteInstruction(event.target.value)} placeholder="原创改写要求（可选）" />{activeDismantleBook.boundProjectId && <button className="btn-primary" onClick={() => void generateDismantleChapter()}>确认并生成目标章节</button>}</div></article>}
                 </div>
               </section>}
@@ -7352,8 +7578,10 @@ function App() {
       )}
 
       {showBatchGenerationModal && batchGenerationProjectId !== null && (() => {
-        const target = projects.find(item => item.id === batchGenerationProjectId);
+      const target = projects.find(item => item.id === batchGenerationProjectId);
         if (!target) return null;
+        const failedBatchItem = batchGenerationItems.find(item => item.status === 'error');
+        const resumableBatchCount = failedBatchItem ? batchGenerationItems.filter(item => item.chapterNumber >= failedBatchItem.chapterNumber).length : 0;
         return <div className="modal-overlay" onClick={() => setShowBatchGenerationModal(false)}>
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="batch-generation-title" onClick={event => event.stopPropagation()}>
             <div className="modal-header"><h3 id="batch-generation-title">一键生成章节</h3><button className="modal-close" aria-label={batchGenerationRunning ? '转入后台运行' : '关闭'} onClick={() => setShowBatchGenerationModal(false)}>×</button></div>
@@ -7361,9 +7589,15 @@ function App() {
               <p>《{target.title}》将从第 {target.chapters.length + 1} 章开始，逐章生成章纲和正文。每章自动读取上一章正文，章纲默认不超过 700 字（含标点）。</p>
               <label className="form-group"><span>生成章数</span><input className="input" type="number" min="1" max="20" step="1" value={batchGenerationCount} disabled={batchGenerationRunning} onChange={event => setBatchGenerationCount(event.target.value)} /></label>
               {batchGenerationRunning && <p className="settings-network-note">{batchGenerationProgress || '正在生成...'}</p>}
+              {failedBatchItem && !batchGenerationRunning && <p className="batch-resume-hint">上次在第 {failedBatchItem.chapterNumber} 章中断，已完成章节会保留，可从第 {failedBatchItem.chapterNumber} 章继续生成后续 {resumableBatchCount} 章。</p>}
               {batchGenerationItems.length > 0 && <div className="batch-generation-items" aria-live="polite">{batchGenerationItems.map(item => <article key={item.chapterNumber} className={`batch-generation-item ${item.status}`}><div className="batch-generation-item-heading"><strong>{item.title}</strong><span>{item.status === 'pending' ? '等待' : item.status === 'outline' ? '生成章纲' : item.status === 'writing' ? '生成正文' : item.status === 'memory' ? '更新记忆' : item.status === 'complete' ? '已完成' : '失败'}</span></div>{item.outline && <details><summary>查看章纲</summary><pre>{item.outline}</pre></details>}{item.content && <details open={item.status === 'complete'}><summary>查看正文 · {countNovelCharacters(item.content)} 字</summary><pre>{item.content}</pre></details>}{item.memory && <small className="batch-generation-memory">记忆：{item.memory}</small>}</article>)}</div>}
             </div>
-            <div className="modal-footer"><button className="btn-secondary" onClick={() => setShowBatchGenerationModal(false)}>{batchGenerationRunning ? '后台运行' : '关闭'}</button><button className="btn-primary" disabled={batchGenerationRunning} onClick={() => void generateBatchChapters(target, Number(batchGenerationCount) || 1)}>{batchGenerationRunning ? '生成中...' : batchGenerationItems.length ? '重新生成' : '开始生成'}</button></div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setShowBatchGenerationModal(false)}>{batchGenerationRunning ? '后台运行' : '关闭'}</button>
+              {failedBatchItem && <button className="btn-secondary batch-resume-button" disabled={batchGenerationRunning} onClick={() => resumeBatchGeneration(target)}>从第 {failedBatchItem.chapterNumber} 章继续</button>}
+              {batchGenerationItems.length > 0 && <button className="btn-secondary" disabled={batchGenerationRunning} onClick={() => { setBatchGenerationItems([]); void generateBatchChapters(target, Number(batchGenerationCount) || 1); }}>重新生成</button>}
+              <button className="btn-primary" disabled={batchGenerationRunning} onClick={() => void generateBatchChapters(target, Number(batchGenerationCount) || 1)}>{batchGenerationRunning ? '生成中...' : batchGenerationItems.length ? '再次生成新的' : '开始生成'}</button>
+            </div>
           </div>
         </div>;
       })()}

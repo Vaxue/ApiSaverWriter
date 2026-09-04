@@ -1,6 +1,6 @@
 [package]
 name = "apisaverwriter"
-version = "0.1.4"
+version = "0.1.6"
 description = "AI Novel Writing Assistant - 用最少的API写出最火的小说"
 authors = ["you"]
 license = "AGPL-3.0-or-later"

@@ -294,6 +294,55 @@ const stringList = (value: unknown, limit = 20): string[] => Array.isArray(value
   ? value.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, limit)
   : [];
 
+/**
+ * Shared target-novel context for dismantling flows. The source book is only
+ * a structural reference; cards, canon, continuity and author rules belong to
+ * the target novel and therefore take precedence over every source detail.
+ */
+function renderTargetNovelContext(params: Record<string, unknown> | undefined): string {
+  if (!params) return "";
+  const title = String(params.targetProjectTitle || params.projectTitle || "").trim();
+  if (!title && !params.targetCards && !params.cards) return "";
+  const synopsis = compactText(params.targetProjectSynopsis || params.projectSynopsis || "暂无", 1600);
+  const world = Array.isArray(params.targetWorldSetting)
+    ? params.targetWorldSetting.map(item => item && typeof item === "object" ? `### ${compactText((item as Record<string, unknown>).title || "世界观与作品设定", 100)}\n${compactText((item as Record<string, unknown>).content || "", 5500)}` : "").filter(Boolean).join("\n\n")
+    : "";
+  const cards = (Array.isArray(params.targetCards) ? params.targetCards : params.cards);
+  const cardSection = Array.isArray(cards) && cards.length
+    ? cards.slice(0, 10).map(item => {
+      const card = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      const type = String(card.type || "知识卡");
+      const priority = /角色卡|金手指卡/u.test(type) ? "核心固定卡" : "相关设定卡";
+      return `### [${priority}] ${compactText(card.title || "未命名卡片", 100)}（${type}）\n${compactText(card.content || "", 1200)}${card.currentState ? `\n当前状态：${compactText(card.currentState, 500)}` : ""}`;
+    }).join("\n\n")
+    : "暂无自动匹配卡片";
+  const previous = Array.isArray(params.previousChapters)
+    ? params.previousChapters.slice(-1).map(item => item && typeof item === "object" ? `### ${compactText((item as Record<string, unknown>).title || "上一章", 100)}\n${compactText((item as Record<string, unknown>).content || "", 8500)}` : "").filter(Boolean).join("\n\n")
+    : "";
+  const memories = Array.isArray(params.memories)
+    ? params.memories.slice(-1).map(item => item && typeof item === "object" ? compactText(JSON.stringify(item), 4200) : "").filter(Boolean).join("\n")
+    : "";
+  const documents = Array.isArray(params.memoryDocuments)
+    ? params.memoryDocuments.slice(0, 2).map(item => item && typeof item === "object" ? compactText((item as Record<string, unknown>).content || "", 3500) : "").filter(Boolean).join("\n\n")
+    : "";
+  const outlineList: unknown[] = Array.isArray(params.targetProjectOutlines)
+    ? params.targetProjectOutlines
+    : Array.isArray(params.targetOutlines) ? params.targetOutlines : [];
+  const outlines = outlineList.length
+    ? outlineList.filter(item => item && typeof item === "object").slice(0, 4).map(item => {
+      const outline = item as Record<string, unknown>;
+      return `### ${compactText(outline.kind || outline.title || "大纲", 80)}\n${compactText(outline.content || "", 3500)}`;
+    }).join("\n\n")
+    : "";
+  const graph = params.targetKnowledgeGraph || params.knowledgeGraph;
+  const graphText = graph && typeof graph === "object" ? compactText(JSON.stringify(graph), 4200) : "";
+  const skills = Array.isArray(params.skills)
+    ? params.skills.slice(0, 6).map(item => item && typeof item === "object" ? `### ${String((item as Record<string, unknown>).displayName || (item as Record<string, unknown>).name || "技能")}\n${compactText((item as Record<string, unknown>).content || (item as Record<string, unknown>).description || "", 900)}` : "").filter(Boolean).join("\n\n")
+    : "";
+  const preferences = stringList(params.authorPreferences, 20).join("；");
+  return `\n## 目标作品固定设定（优先级高于拆书素材）\n书名：${compactText(title || "未命名小说", 180)}\n简介：${synopsis}\n${world ? `\n### 世界观与作品设定\n${world}` : ""}${outlines ? `\n\n### 目标作品大纲\n${outlines}` : ""}\n\n### 自动匹配知识卡（角色卡、主角性格、金手指卡优先）\n${cardSection}${graphText ? `\n\n### 相关知识图谱\n${graphText}` : ""}${previous ? `\n\n### 上一章正文（只用于连续性）\n${previous}` : ""}${memories ? `\n\n### 上一章记忆\n${memories}` : ""}${documents ? `\n\n### 更早章节摘要\n${documents}` : ""}${skills ? `\n\n### 写作技能\n${skills}` : ""}${preferences ? `\n\n### 作者偏好\n${preferences}` : ""}\n\n硬性规则：角色卡、主角性格、金手指卡、世界观和上一章状态是目标作品的固定事实；拆书原文和参考作品只能提供抽象结构，禁止把其人名、专名、设定或事实带入目标作品。未知内容标记为“待揭示”，不得擅自改写固定卡片。`;
+}
+
 const memoryStringList = (value: unknown, limit = 40): string[] => Array.isArray(value)
   ? value.map(item => {
       if (typeof item === "string") return item.trim();
@@ -1880,9 +1929,12 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         ...networkProxyConfig(req.params),
       });
       const source = compactText(sourceContent, Math.min(contextBudgetBytes(Number(contextWindow) || undefined, 35, 18), 28_000));
+      const targetContext = renderTargetNovelContext(req.params);
       const prompt = `你是长篇小说结构分析编辑。请拆解《${String(bookTitle || "未命名作品")}》第 ${Number(chapterNumber) || 1} 章《${String(chapterTitle || "未命名章节")}》的剧情结构，生成可用于原创创作的细纲。
 
 要求：只提炼抽象剧情结构、人物目标、冲突、信息揭示、伏笔和节奏；不得抄录原文句子，不得复述大段原文。章节细纲必须可执行，保留因果关系但不保留特定表达。
+
+${targetContext ? `${targetContext}\n\n分析时请额外标注参考结构如何映射到目标作品的核心角色、主角性格和金手指，但不要把参考作品专名写入细纲。` : ""}
 
 ## 待分析正文
 ${source}
@@ -1973,6 +2025,7 @@ ${sampleText}
         ...networkProxyConfig(req.params),
       });
       const wordLimit = Math.max(600, Math.min(8000, Math.floor(Number(targetWords) || 2200)));
+      const targetContext = renderTargetNovelContext(req.params);
       const prompt = `你是原创网络小说作者。根据下面从《${String(bookTitle || "参考作品")}》抽象出的章节结构，写一份完全独立的新章节草稿。
 
 不可使用原作品的人名、地名、专有设定、原句、独特措辞或可识别事件细节；请重构人物、场景、冲突解决方式与情节表面，保留的只能是一般性的戏剧功能。只输出正文，不加标题、注释或 Markdown。
@@ -1981,8 +2034,12 @@ ${sampleText}
 作者要求：${String(instruction || "保留节奏和冲突强度，写成独立故事。")}
 目标长度：约 ${wordLimit} 个中文字符。
 
+${targetContext}
+
 ## 抽象细纲
-${compactText(detailedOutline, 14_000)}`;
+${compactText(detailedOutline, 14_000)}
+
+最终校验：正文只能使用目标作品固定设定中的角色、主角性格、金手指、地点和规则；参考作品只保留抽象冲突功能。若两者冲突，以目标作品固定设定为准。只输出正文，不输出 JSON、标题、说明或参考作品专名。`;
       const response = await client.chat([{ role: "user", content: prompt }], { temperature: 0.75, max_tokens: Math.min(9000, Math.ceil(wordLimit * 1.7)), retryAttempts: 3 });
       return { id: req.id, result: { content: response.content.trim().replace(/^```(?:markdown|text)?\s*/i, "").replace(/```$/u, "").trim() } };
     }
@@ -2005,6 +2062,8 @@ ${compactText(detailedOutline, 14_000)}`;
 
 只使用目标小说的人物、世界观和大纲；如果素材与设定冲突，以目标设定为准并重构。必须写成独立原创内容，不复用参考作品的专名、句子和可识别桥段。只输出章节正文，不加标题。
 
+${renderTargetNovelContext(req.params)}
+
 ## 目标作品简介
 ${String(projectSynopsis || "暂无")}
 
@@ -2013,7 +2072,9 @@ ${compactText(projectOutlines, 7000)}
 
 ${styleProfile ? `## 已绑定文风 Skill\n${compactText(styleProfile, 6000)}\n` : ""}
 ## 章节素材｜${String(chapterTitle || "新章节")}
-${compactText(rewriteContent || detailedOutline, 14_000)}`;
+${compactText(rewriteContent || detailedOutline, 14_000)}
+
+最终校验：角色卡、主角性格、金手指卡、世界观、上一章状态优先于章节素材；素材中的参考作品专名不得进入正文。只输出目标作品正文，不输出 JSON、标题、解释或设定清单。`;
       const response = await client.chat([{ role: "user", content: prompt }], { temperature: 0.72, max_tokens: 7000, retryAttempts: 3 });
       return { id: req.id, result: { title: String(chapterTitle || "新章节"), content: response.content.trim().replace(/^```(?:markdown|text)?\s*/i, "").replace(/```$/u, "").trim() } };
     }
