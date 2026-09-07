@@ -142,6 +142,81 @@ function appendAgentSession(state: AgentSessionState, instruction: string, concl
   return compactAgentSession(next, contextWindowKB, baseBytes);
 }
 
+// Model-backed session compression: the user's configured LLM rewrites the
+// compressed summary so historic turns are distilled instead of truncated.
+// compactAgentSession stays as the deterministic fallback for missing keys
+// and failed summarization calls.
+type SessionSummarizer = (material: string, maxBytes: number) => Promise<string>;
+
+const sessionSummarizerSystemPrompt = `你是长篇小说创作 Agent 的会话记忆压缩器。把历史请求与结论压缩成一份后续创作可直接使用的交接摘要。
+只保留材料中明确出现的事实，不补写、不推断任何未发生的剧情；优先保留伏笔、时间线、人物状态变化、设定事实和未解决的冲突；使用简洁的条目式中文 Markdown；不要输出解释性前言。`;
+
+const createSessionSummarizer = (params?: Record<string, unknown>): SessionSummarizer | undefined => {
+  const apiKey = params && typeof params.apiKey === "string" ? params.apiKey.trim() : "";
+  if (!apiKey) return undefined;
+  return async (material: string, maxBytes: number) => {
+    const client = new ApiSaverClient({
+      apiKey,
+      apiKeys: stringList(params?.apiKeys, 12),
+      baseURL: String(params?.baseURL || "https://api.apisaver.com/v1"),
+      defaultModel: String(params?.model || ""),
+      apiMode: String(params?.apiMode || "openai") as "openai" | "responses" | "anthropic",
+      reasoningMode: String(params?.reasoningMode || "auto"),
+      contextWindowKB: Number(params?.contextWindow) || undefined,
+      ...networkProxyConfig(params),
+    });
+    const result = await client.chat([
+      { role: "system", content: sessionSummarizerSystemPrompt },
+      { role: "user", content: `请在不超过 ${Math.floor(maxBytes / 3)} 个汉字内输出压缩摘要。\n\n${material}` },
+    ], { max_tokens: 2000, temperature: 0.2, retryAttempts: 2 });
+    return result.content.trim();
+  };
+};
+
+async function compactAgentSessionWithModel(state: AgentSessionState, contextWindowKB: unknown, baseBytes: number, summarize?: SessionSummarizer): Promise<{ state: AgentSessionState; compressed: boolean }> {
+  const threshold = Math.floor(Math.max(16, Number(contextWindowKB) || 128) * 1024 * 0.8);
+  if (baseBytes + byteLength(renderAgentSession(state)) < threshold) return { state, compressed: false };
+  const fallback = compactAgentSession(state, contextWindowKB, baseBytes);
+  const historicTurns = state.recentTurns.slice(0, -SESSION_KEEP_TURNS);
+  if (!summarize || !historicTurns.length) return fallback;
+  try {
+    const availableBytes = Math.max(4096, threshold - baseBytes);
+    const summaryBudget = Math.max(1200, Math.floor(availableBytes * 0.3));
+    const material = [
+      state.summary ? `## 既有摘要\n${state.summary}` : "",
+      `## 待压缩的历史轮次\n${historicTurns.map((turn, index) => `### 轮次 ${index + 1}\n请求：${turn.instruction || "延续上一轮"}\n结论：${turn.conclusion || "暂无"}`).join("\n\n")}`,
+    ].filter(Boolean).join("\n\n");
+    const summarized = await summarize(material, summaryBudget);
+    if (!summarized) return fallback;
+    return {
+      compressed: true,
+      state: {
+        version: 1,
+        summary: compactText(summarized, summaryBudget),
+        recentTurns: fallback.state.recentTurns,
+        compressedAt: new Date().toISOString(),
+      },
+    };
+  } catch (error) {
+    console.error("[agent-runtime] session summarization failed; falling back to rule-based compression", error);
+    return fallback;
+  }
+}
+
+async function appendAgentSessionWithModel(state: AgentSessionState, instruction: string, conclusion: string, contextWindowKB: unknown, baseBytes: number, summarize?: SessionSummarizer): Promise<{ state: AgentSessionState; compressed: boolean }> {
+  const next: AgentSessionState = {
+    version: 1,
+    summary: state.summary,
+    recentTurns: [...state.recentTurns, {
+      instruction: compactText(instruction, 2200),
+      conclusion: compactText(conclusion, 6500),
+      createdAt: new Date().toISOString(),
+    }],
+    compressedAt: state.compressedAt,
+  };
+  return compactAgentSessionWithModel(next, contextWindowKB, baseBytes, summarize);
+}
+
 // Byte-stable prompt for compatible upstream prefix caches. Dynamic chapter
 // instructions and the editable outline are deliberately sent afterwards.
 const outlineWriterSystemPrompt = `你是长篇网络小说总策划与章节规划 Agent。根据作品资料编写可直接执行的 Markdown 大纲。
@@ -2166,7 +2241,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}
         ...(cardRecentTurns ? [{ role: "user" as const, content: compactText(cardRecentTurns, 7000) }] : []),
       ], { response_format: { type: "json_object" } }, chunk => emitter.chunk(chunk));
       emitter.complete("卡片内容生成完成");
-      const nextCardSession = appendAgentSession(cardSession, String(instruction || "补全卡片知识，保持设定一致"), response.content, contextWindow, byteLength(stableProjectPacket));
+      const nextCardSession = await appendAgentSessionWithModel(cardSession, String(instruction || "补全卡片知识，保持设定一致"), response.content, contextWindow, byteLength(stableProjectPacket), createSessionSummarizer(req.params));
       cardSessionCache.set(cardSessionKey, nextCardSession.state);
       void writePersistentContext(`card-session-${cardSessionKey}`, nextCardSession.state);
       void writePersistentDocument(`card-session-${cardSessionKey}`, `# 卡片会话摘要\n\n${nextCardSession.state.summary || "暂无压缩摘要"}`);
@@ -2264,7 +2339,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}
         ? await readPersistentContext<unknown>(`outline-session-${stableHash({ scope: "outline", outlineId: String(outlineId || "active"), sessionId: String(previousSessionId), projectTitle, kind, model, apiMode, targetChapterId: targetChapterRecord?.id, sourceChapterId: sourceChapterRecord?.id, formatOutlineId: formatOutlineRecord?.id, stableProjectPacket })}`)
         : undefined;
       const outlineDocumentSummary = await readPersistentDocument(`outline-session-${outlineSessionKey}`);
-      const outlineSession = compactAgentSession(outlineDocumentSummary ? { ...(inheritedOutlineSession || { version: 1, recentTurns: [] }), summary: outlineDocumentSummary } : (inheritedOutlineSession || (previousOutlineSessionState !== undefined ? normalizeAgentSession(previousOutlineSessionState) : undefined) || { version: 1, summary: "", recentTurns: [] }), contextWindow, byteLength(stableProjectPacket)).state;
+      const outlineSession = (await compactAgentSessionWithModel(outlineDocumentSummary ? { ...(inheritedOutlineSession || { version: 1, recentTurns: [] }), summary: outlineDocumentSummary } : (inheritedOutlineSession || (previousOutlineSessionState !== undefined ? normalizeAgentSession(previousOutlineSessionState) : undefined) || { version: 1, summary: "", recentTurns: [] }), contextWindow, byteLength(stableProjectPacket), createSessionSummarizer(req.params))).state;
       const outlineHistorySummary = renderSessionSummary(outlineSession);
       const outlineRecentTurns = renderRecentTurns(outlineSession);
       emitter.progress("retrieve", 32, "步骤 2/5：装载唯一正文依据、上一章结尾与格式参考");
@@ -2540,11 +2615,11 @@ ${compactText(content, 26000)}
         const resultRecord = result as Record<string, unknown>;
         const handoff = [resultRecord.chapterPlan, resultRecord.summary, resultRecord.reviewResult && JSON.stringify(resultRecord.reviewResult)].filter(Boolean).join("\n");
         if (handoff) {
-          const nextChapterSession = appendAgentSession(chapterSession, String(instruction), handoff, contextWindow, prepared.report.packedBytes);
+          const nextChapterSession = await appendAgentSessionWithModel(chapterSession, String(instruction), handoff, contextWindow, prepared.report.packedBytes, createSessionSummarizer(req.params));
           novelSessionCache.set(sessionKey, nextChapterSession.state);
           void writePersistentContext(`chapter-session-${sessionKey}`, nextChapterSession.state);
           void writePersistentDocument(`chapter-session-${sessionKey}`, `# 章节会话摘要\n\n${nextChapterSession.state.summary || "暂无压缩摘要"}`);
-          if (nextChapterSession.compressed) streamEmitter.progress("review", 96, "会话动态上下文已超过 80%，已自动压缩为摘要并保留最近两轮");
+          if (nextChapterSession.compressed) streamEmitter.progress("review", 96, "会话动态上下文已超过 80%，已用模型压缩为交接摘要并保留最近两轮");
         }
         const resultWithUsage = {
           ...result,
