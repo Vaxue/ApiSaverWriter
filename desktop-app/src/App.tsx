@@ -631,6 +631,7 @@ interface AgentMemoryResult {
 }
 
 type AgentStage = 'idle' | 'starting' | 'intent' | 'retrieve' | 'plan' | 'draft' | 'review' | 'done' | 'error';
+type ModelProviderMode = 'local' | 'api';
 type ApiMode = 'openai' | 'responses' | 'anthropic';
 type ReasoningMode = 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max' | 'custom';
 type AgentProgressStatus = 'pending' | 'active' | 'complete' | 'error';
@@ -642,6 +643,7 @@ const skillCategoryLabels: Record<string, string> = {
 };
 
 interface AgentConfig {
+  provider: ModelProviderMode;
   serviceName: string;
   enabled: boolean;
   apiMode: ApiMode;
@@ -737,6 +739,8 @@ const isAgentWorkflowStep = (value: string | undefined): value is AgentWorkflowS
 const agentRunning = (stage: AgentStage) => !['idle', 'done', 'error'].includes(stage);
 
 const defaultBaseURL = 'https://api.apisaver.com/v1';
+const defaultLocalBaseURL = 'http://127.0.0.1:8080/v1';
+const localDefaultModel = 'MiniCPM5-2B';
 const defaultPublishConfig: PublishConfig = {
   platform: 'fanqie',
   enabled: false,
@@ -770,21 +774,22 @@ const normalizeAgentConfig = (value: unknown): AgentConfig => {
       : [];
     return mappedKeys.length ? [[model, Array.from(new Set(mappedKeys))]] : [];
   }));
+  const provider: ModelProviderMode = parsed.provider === 'api' || (!('provider' in parsed) && apiKeys.length > 0) ? 'api' : 'local';
+  const defaultModel = provider === 'local' ? localDefaultModel : fallbackModels[0];
   return {
-    serviceName: typeof parsed.serviceName === 'string' ? parsed.serviceName : 'ApiSaver（省API）',
+    provider,
+    serviceName: typeof parsed.serviceName === 'string' ? parsed.serviceName : provider === 'local' ? '本地模型（免费）' : 'ApiSaver（省API）',
     enabled: parsed.enabled !== false,
     // ApiSaverWriter is a managed OpenAI-compatible gateway. Model selection
     // chooses its matching key; it must not also switch the wire protocol.
     apiMode: 'openai',
-    // ApiSaverWriter uses one managed gateway. Keep legacy/custom values from
-    // leaking into requests or making the settings UI appear configurable.
-    baseURL: defaultBaseURL,
+    baseURL: provider === 'local' ? (typeof parsed.baseURL === 'string' && /^https?:\/\//u.test(parsed.baseURL) && /(?:localhost|127\.0\.0\.1|\[::1\])/iu.test(parsed.baseURL) ? parsed.baseURL : defaultLocalBaseURL) : defaultBaseURL,
     apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : apiKeys[0] || '',
     apiKeys,
     imageApiKey: typeof parsed.imageApiKey === 'string' ? parsed.imageApiKey.trim() : '',
     imageModel: typeof parsed.imageModel === 'string' && parsed.imageModel.trim() ? parsed.imageModel.trim() : 'gpt-image-2',
     modelKeyMap,
-    model: typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : fallbackModels[0],
+    model: typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : defaultModel,
     contextWindow: Number((parsed as Record<string, unknown>).contextWindowKB ?? (Number(parsed.contextWindow) > 1024 ? Number(parsed.contextWindow) / 1024 : parsed.contextWindow)) || 128,
     reasoningMode: parsed.reasoningMode === 'off' || parsed.reasoningMode === 'low' || parsed.reasoningMode === 'medium' || parsed.reasoningMode === 'high' || parsed.reasoningMode === 'max' || parsed.reasoningMode === 'custom' ? parsed.reasoningMode : 'auto',
     proxyEnabled: parsed.proxyEnabled === true,
@@ -793,7 +798,11 @@ const normalizeAgentConfig = (value: unknown): AgentConfig => {
     memorySummaryChapterCount: Math.max(0, Math.min(20, Number(parsed.memorySummaryChapterCount) || 5)),
   };
 };
-const agentNetworkParams = (config: AgentConfig) => ({
+const agentNetworkParams = (config: Pick<AgentConfig, 'provider' | 'baseURL' | 'proxyEnabled' | 'proxyURL' | 'proxyBypassLocal'>) => ({
+  provider: config.provider,
+  // The runtime uses the local endpoint only in local mode. Keeping this in
+  // the shared spread makes every Agent graph request switch consistently.
+  ...(config.provider === 'local' ? { baseURL: config.baseURL.trim() || defaultLocalBaseURL } : {}),
   proxyEnabled: config.proxyEnabled,
   proxyURL: config.proxyURL.trim(),
   proxyBypassLocal: config.proxyBypassLocal,
@@ -1711,7 +1720,10 @@ function App() {
       });
     } catch { /* Runtime may not have started yet. */ }
   };
-  useEffect(() => { void invoke<string>('start_agent_runtime').then(() => syncRuntimeUsage()); }, []);
+  useEffect(() => {
+    if (agentConfig.provider === 'local') void invoke<string>('start_local_model').catch(() => undefined);
+    void invoke<string>('start_agent_runtime').then(() => syncRuntimeUsage());
+  }, [agentConfig.provider]);
   useEffect(() => {
     const key = 'apisaverwriter-support-announcement-seen';
     if (localStorage.getItem(key) !== '1') {
@@ -1791,9 +1803,9 @@ function App() {
     try {
       const saved = localStorage.getItem('agent-models');
       const parsed = saved ? JSON.parse(saved) : [];
-      return Array.isArray(parsed) && parsed.length > 0 ? parsed.filter((model): model is string => typeof model === 'string') : fallbackModels;
+      return Array.isArray(parsed) && parsed.length > 0 ? parsed.filter((model): model is string => typeof model === 'string') : agentConfig.provider === 'local' ? [agentConfig.model || localDefaultModel] : fallbackModels;
     } catch {
-      return fallbackModels;
+      return agentConfig.provider === 'local' ? [agentConfig.model || localDefaultModel] : fallbackModels;
     }
   });
   const [settingsModels, setSettingsModels] = useState<string[]>(availableModels);
@@ -2374,7 +2386,7 @@ function App() {
 
   const generateProjectField = async (field: 'title' | 'synopsis') => {
     if (projectGeneratingField) return;
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写 API Saver Key，再生成书名或作品简介。' });
       return;
     }
@@ -2791,7 +2803,7 @@ function App() {
       setNotice({ title: '章节暂无正文', content: '该章节尚未下载正文，无法生成章纲。' });
       return;
     }
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再生成章节章纲。' });
       return;
     }
@@ -2836,7 +2848,7 @@ function App() {
       setNotice({ title: '没有待分析章节', content: '已生成章节会自动跳过；请勾选待分析章节，或点击“继续拆书”。' });
       return;
     }
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再运行拆书分析。' });
       return;
     }
@@ -2910,7 +2922,7 @@ function App() {
       setNotice({ title: '请先生成章纲', content: '确认当前章节的细纲后，再生成原创改写稿。' });
       return;
     }
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再生成原创改写稿。' });
       return;
     }
@@ -2958,7 +2970,7 @@ function App() {
       setNotice({ title: '请选择样本章节', content: '至少选择一章有正文的章节用于文风蒸馏。' });
       return;
     }
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再蒸馏文风。' });
       return;
     }
@@ -3013,7 +3025,7 @@ function App() {
       setNotice({ title: '请先准备章节素材', content: '先生成章纲，或完成原创改写稿后再生成章节。' });
       return;
     }
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥。' });
       return;
     }
@@ -3230,7 +3242,7 @@ function App() {
 
   const generateSkillWithAI = async () => {
     if (skillGenerating) return;
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中配置可用模型，再生成技能。' });
       return;
     }
@@ -3655,7 +3667,7 @@ function App() {
 
   const runAITool = async (mode: 'polish' | 'de-ai' | 'continue') => {
     if (!editingProject || !activeChapter || aiToolRunning) return;
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中配置可用模型。' });
       return;
     }
@@ -4258,7 +4270,7 @@ function App() {
       window.setTimeout(() => void publishChapterToFanqie(chapter, localProject), 0);
     }
 
-    if (!chapter.content.trim() || !agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!chapter.content.trim() || !agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '章节已保存', content: chapter.content.trim() ? '章节和本地章节记忆已更新。' : '空章节已保存，并移除了本章记忆。' });
       setChapterSaving(false);
       return;
@@ -4456,7 +4468,7 @@ function App() {
       if ('__TAURI_INTERNALS__' in window) void invoke<string>('save_projects', { projects: initialProjects });
       else localStorage.setItem('projects', JSON.stringify(initialProjects));
     }
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '章节已保存', content: `${chapter.title} 已创建对应章纲，配置 API Key 后可自动补全章纲。` });
       return;
     }
@@ -4608,7 +4620,7 @@ function App() {
     if (!editingProject || activeOutlineId === null || outlineGenerating) return;
     const outline = editingProject.outlines.find(item => item.id === activeOutlineId);
     if (!outline) return;
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写 API Saver Key，再生成大纲。' });
       return;
     }
@@ -4707,7 +4719,7 @@ function App() {
 
   const generateBatchChapters = async (project: Project, requestedCount: number, options?: { resumeFromChapter?: number }) => {
     if (batchGenerationRunning) return;
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写可用 API Key，再批量生成章节。' });
       return;
     }
@@ -4890,7 +4902,7 @@ function App() {
 
   const generateCardWithAI = async () => {
     if (!editingProject || cardGenerating) return;
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写 API Key，再生成知识卡片。' });
       return;
     }
@@ -5094,7 +5106,7 @@ function App() {
 
   const runReviewCenter = async () => {
     if (!editingProject || reviewRunning) return;
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写 API Saver Key，再运行审查中心。' });
       return;
     }
@@ -5252,7 +5264,7 @@ function App() {
 
   const runChapterAgent = async () => {
     if (!editingProject || !activeChapter || agentRunning(agentStage)) return;
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+    if (!agentConfig.enabled || (agentConfig.provider !== 'local' && !agentConfig.apiKey.trim())) {
       setAgentError('请先填写 API Saver Key');
       setAgentStage('error');
       return;
@@ -5712,17 +5724,19 @@ function App() {
   };
 
   const pullModels = async () => {
-    const keys = Array.from(new Set([...(settingsDraft.apiKeys || []), settingsDraft.apiKey].map(key => key.trim()).filter(Boolean)));
-    if (!keys.length) {
+    const isLocal = settingsDraft.provider === 'local';
+    const keys = isLocal ? [''] : Array.from(new Set([...(settingsDraft.apiKeys || []), settingsDraft.apiKey].map(key => key.trim()).filter(Boolean)));
+    if (!isLocal && !keys.length) {
       setNotice({ title: '需要 API Key', content: '请先填写 API Key，再拉取模型列表。' });
       return;
     }
     setModelsLoading(true);
     try {
+      if (settingsDraft.provider === 'local') await invoke<string>('start_local_model');
       await invoke<string>('start_agent_runtime');
       const responses = await Promise.allSettled(keys.map(async (apiKey) => ({ apiKey, result: await invoke<{ models?: string[] }>('call_agent_rpc', {
         method: 'models.list',
-        params: { baseURL: defaultBaseURL, apiKey, apiKeys: [apiKey], apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) },
+        params: { baseURL: settingsDraft.provider === 'local' ? settingsDraft.baseURL : defaultBaseURL, provider: settingsDraft.provider, apiKey, apiKeys: [apiKey], apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) },
       }) })));
       const successful = responses.filter((response): response is PromiseFulfilledResult<{ apiKey: string; result: { models?: string[] } }> => response.status === 'fulfilled');
       const modelKeyMap = successful.reduce<Record<string, string[]>>((map, response) => {
@@ -5747,7 +5761,7 @@ function App() {
   };
 
   const testSelectedModel = async () => {
-    if (!settingsDraft.apiKey.trim()) {
+    if (settingsDraft.provider !== 'local' && !settingsDraft.apiKey.trim()) {
       setModelListMessage('请先填写 API 密钥，再测试模型。');
       return;
     }
@@ -5762,8 +5776,8 @@ function App() {
         params: {
           apiKey: orderedKeys[0] || settingsDraft.apiKey.trim(),
           apiKeys: orderedKeys,
-          baseURL: defaultBaseURL,
-          apiMode: settingsDraft.apiMode,
+          baseURL: settingsDraft.provider === 'local' ? settingsDraft.baseURL : defaultBaseURL,
+          provider: settingsDraft.provider,
           model: selectedModel,
           reasoningMode: settingsDraft.reasoningMode,
           contextWindow: settingsDraft.contextWindow,
@@ -5870,9 +5884,9 @@ function App() {
     localStorage.setItem('agent-models', JSON.stringify(enabledModels));
     setAgentConfig(applyModelKeyRouting({
       ...settingsDraft,
-      serviceName: settingsDraft.serviceName.trim() || 'ApiSaver（省API）',
+      serviceName: settingsDraft.serviceName.trim() || (settingsDraft.provider === 'local' ? '本地模型（免费）' : 'ApiSaver（省API）'),
       apiMode: 'openai',
-      baseURL: defaultBaseURL,
+      baseURL: settingsDraft.provider === 'local' ? (settingsDraft.baseURL.trim() || defaultLocalBaseURL) : defaultBaseURL,
       apiKey: apiKeys[0] || '',
       apiKeys,
       imageApiKey: settingsDraft.imageApiKey.trim(),
@@ -5881,6 +5895,8 @@ function App() {
       contextWindow: Math.max(16, Number(settingsDraft.contextWindow) || 128),
     }, selectedModel));
     setAgentError('');
+    if (settingsDraft.provider === 'local') void invoke<string>('start_local_model').catch(error => setModelListMessage(`本地模型未启动：${String(error)}`));
+    else void invoke('stop_local_model').catch(() => undefined);
     setAgentStage('idle');
     setShowSettingsModal(false);
     setNotice({ title: '设置已保存', content: 'API 地址、模型和 Key 已保存到本机。' });
@@ -7252,17 +7268,25 @@ function App() {
                     <input className="input" value={settingsDraft.serviceName} onChange={(event) => setSettingsDraft({ ...settingsDraft, serviceName: event.target.value })} placeholder="服务名称" />
                   </div>
                   <div className="form-group">
+                    <label>运行方式</label>
+                    <div className="settings-segmented-control">
+                      <button className={settingsDraft.provider === 'local' ? 'active' : ''} onClick={() => setSettingsDraft(current => ({ ...current, provider: 'local', serviceName: '本地模型（免费）', baseURL: current.baseURL && /(?:localhost|127\\.0\\.0\\.1|\\[::1\\])/iu.test(current.baseURL) ? current.baseURL : defaultLocalBaseURL, model: localDefaultModel }))}>本地免费</button>
+                      <button className={settingsDraft.provider === 'api' ? 'active' : ''} onClick={() => setSettingsDraft(current => ({ ...current, provider: 'api', serviceName: 'ApiSaver（省API）', baseURL: defaultBaseURL, model: fallbackModels[0] }))}>API 付费</button>
+                    </div>
+                    <small className="settings-network-note">本地模式通过 llama.cpp / Ollama 的 OpenAI 兼容接口运行 MiniCPM5-2B；API 模式使用中转服务并按账户计费。</small>
+                  </div>
+                  <div className="form-group">
                     <label>API 模式</label>
                     <div className="settings-segmented-control">
-                      <span className="settings-fixed-mode">OpenAI 兼容接口（所有模型统一使用）</span>
+                      <span className="settings-fixed-mode">OpenAI 兼容接口（统一请求协议）</span>
                     </div>
                   </div>
                   <div className="form-group">
-                    <label>接口地址 <small>固定官方服务</small></label>
-                    <input className="input settings-fixed-address" value={defaultBaseURL} readOnly aria-readonly="true" />
+                    <label>接口地址 <small>{settingsDraft.provider === 'local' ? '本地 llama.cpp / Ollama' : '固定官方服务'}</small></label>
+                    <input className={`input ${settingsDraft.provider === 'api' ? 'settings-fixed-address' : ''}`} value={settingsDraft.provider === 'local' ? settingsDraft.baseURL : defaultBaseURL} readOnly={settingsDraft.provider === 'api'} aria-readonly={settingsDraft.provider === 'api'} placeholder={defaultLocalBaseURL} onChange={(event) => setSettingsDraft({ ...settingsDraft, baseURL: event.target.value })} />
                   </div>
                   <div className="form-group">
-                    <label>API 密钥 <small>{(settingsDraft.apiKeys || []).filter(Boolean).length} 个</small></label>
+                    <label>API 密钥 <small>{settingsDraft.provider === 'local' ? '本地模式无需填写' : `${(settingsDraft.apiKeys || []).filter(Boolean).length} 个`}</small></label>
                     <input className="input" type="password" value={settingsDraft.apiKey} placeholder="请输入主 API Key" onChange={(event) => updatePrimaryApiKey(event.target.value)} />
                     {(settingsDraft.apiKeys || []).length > 1 && <div className="settings-key-tags">{settingsDraft.apiKeys.map((key, index) => <span key={`${key}-${index}`} className={index === 0 ? 'active' : ''}>Key {index + 1} · {key.slice(0, 4)}••••{key.slice(-4)}<button aria-label={`移除 Key ${index + 1}`} onClick={() => removeApiKey(index)}>×</button></span>)}</div>}
                     <div className="model-add-row"><input className="input" type="password" value={customApiKey} placeholder="添加备用供应商 Key" onChange={(event) => setCustomApiKey(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addApiKey(); } }} /><button className="btn-secondary" onClick={addApiKey}>添加 Key</button></div>

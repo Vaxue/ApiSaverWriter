@@ -153,10 +153,11 @@ const sessionSummarizerSystemPrompt = `你是长篇小说创作 Agent 的会话�
 
 const createSessionSummarizer = (params?: Record<string, unknown>): SessionSummarizer | undefined => {
   const apiKey = params && typeof params.apiKey === "string" ? params.apiKey.trim() : "";
-  if (!apiKey) return undefined;
+  if (!apiKey && !/(?:localhost|127\.0\.0\.1|\[::1\]|192\.168\.|10\.|172\.(?:1[6-9]|2\d|3[0-1])\.)/iu.test(String(params?.baseURL || ""))) return undefined;
   return async (material: string, maxBytes: number) => {
     const client = new ApiSaverClient({
-      apiKey,
+      apiKey: apiKey || "",
+      provider: String(params?.provider || "api") as "api" | "local",
       apiKeys: stringList(params?.apiKeys, 12),
       baseURL: String(params?.baseURL || "https://api.apisaver.com/v1"),
       defaultModel: String(params?.model || ""),
@@ -1595,13 +1596,15 @@ const fetchFalooRanking = async (rankType: string, gender: string, params?: Reco
 };
 
 async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
+  const localModelRequest = /(?:localhost|127\.0\.0\.1|\[::1\]|192\.168\.|10\.|172\.(?:1[6-9]|2\d|3[0-1])\.)/iu.test(String(req.params?.baseURL || ""));
+  const hasModelAccess = Boolean(String(req.params?.apiKey || "").trim()) || localModelRequest;
   try {
     if (req.method === "usage.summary") {
       return { id: req.id, result: getRuntimeUsageSummary() };
     }
     if (req.method === "gateway.usage") {
       const { apiKey, apiKeys, proxyEnabled, proxyURL, proxyBypassLocal } = req.params ?? {};
-      if (!apiKey) return { id: req.id, error: { code: -32602, message: "请先在设置中填写 API Key。" } };
+      if (!hasModelAccess) return { id: req.id, error: { code: -32602, message: "请先在设置中填写 API Key。" } };
       const client = new ApiSaverClient({
         apiKey: String(apiKey), apiKeys: stringList(apiKeys, 12),
         proxyEnabled: Boolean(proxyEnabled), proxyURL: String(proxyURL || ""), proxyBypassLocal: proxyBypassLocal === true,
@@ -1610,11 +1613,13 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
     }
     if (req.method === "models.list") {
       const { apiKey, apiKeys, baseURL, apiMode, reasoningMode, contextWindow, proxyEnabled, proxyURL, proxyBypassLocal } = req.params ?? {};
-      if (!apiKey) {
+      const localEndpoint = /(?:localhost|127\.0\.0\.1|\[::1\]|192\.168\.|10\.|172\.(?:1[6-9]|2\d|3[0-1])\.)/iu.test(String(baseURL || ""));
+      if (!apiKey && !localEndpoint) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
@@ -1628,11 +1633,12 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
     }
     if (req.method === "models.test") {
       const { apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!apiKey || !model) {
+      if (!hasModelAccess || !model) {
         return { id: req.id, error: { code: -32602, message: "缺少测试模型所需参数" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model),
@@ -1669,11 +1675,12 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
     }
     if (req.method === "project.generate") {
       const { field, source, title, synopsis, channel, tags, protagonist1, protagonist2, outlines, chapters, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!apiKey || (field !== "title" && field !== "synopsis")) {
+      if (!hasModelAccess || (field !== "title" && field !== "synopsis")) {
         return { id: req.id, error: { code: -32602, message: "缺少生成作品信息所需参数" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
@@ -1724,11 +1731,12 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
     }
     if (req.method === "skill.write") {
       const { name, category, description, content, tags, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!apiKey || (!name && !description && !content)) {
+      if (!hasModelAccess || (!name && !description && !content)) {
         return { id: req.id, error: { code: -32602, message: "缺少创建技能所需参数" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
@@ -1754,7 +1762,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
     }
     if (req.method === "memory.write") {
       const { projectTitle, chapterTitle, content, cards, knowledgeGraph, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!chapterTitle || !content || !apiKey) {
+      if (!chapterTitle || !content || !hasModelAccess) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
       const memoryBudgetBytes = contextBudgetBytes(Number(contextWindow) || undefined, 20, 8);
@@ -1792,7 +1800,8 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         return { id: req.id, result: { ...cachedMemory, contextReport: cachedReport } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-5.5"),
@@ -1974,7 +1983,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
     }
     if (req.method === "ranking.analyze") {
       const { books, platform, rankType, gender, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!apiKey || !Array.isArray(books) || books.length === 0) return { id: req.id, error: { code: -32602, message: "缺少榜单样本或模型配置" } };
+      if (!hasModelAccess || !Array.isArray(books) || books.length === 0) return { id: req.id, error: { code: -32602, message: "缺少榜单样本或模型配置" } };
       const client = new ApiSaverClient({
         apiKey: String(apiKey), apiKeys: stringList(apiKeys, 12), baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"), apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
@@ -1990,11 +1999,12 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
     }
     if (req.method === "book.dismantle") {
       const { bookTitle, chapterTitle, chapterNumber, sourceContent, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!apiKey || !sourceContent) {
+      if (!hasModelAccess || !sourceContent) {
         return { id: req.id, error: { code: -32602, message: "缺少拆书分析所需的正文或模型配置" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
@@ -2040,11 +2050,12 @@ ${source}
     }
     if (req.method === "book.style.distill") {
       const { bookTitle, styleName, samples, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!apiKey || !Array.isArray(samples) || samples.length === 0) {
+      if (!hasModelAccess || !Array.isArray(samples) || samples.length === 0) {
         return { id: req.id, error: { code: -32602, message: "请选择至少一个章节用于蒸馏文风" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
@@ -2086,11 +2097,12 @@ ${sampleText}
     }
     if (req.method === "book.rewrite") {
       const { bookTitle, chapterTitle, detailedOutline, instruction, targetWords, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!apiKey || !detailedOutline) {
+      if (!hasModelAccess || !detailedOutline) {
         return { id: req.id, error: { code: -32602, message: "请先生成并确认章节细纲" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
@@ -2120,11 +2132,12 @@ ${compactText(detailedOutline, 14_000)}
     }
     if (req.method === "book.adapt") {
       const { projectTitle, projectSynopsis, projectOutlines, chapterTitle, detailedOutline, rewriteContent, styleProfile, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!apiKey || (!detailedOutline && !rewriteContent)) {
+      if (!hasModelAccess || (!detailedOutline && !rewriteContent)) {
         return { id: req.id, error: { code: -32602, message: "请先准备章节细纲或原创改写稿" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
@@ -2155,14 +2168,15 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}
     }
     if (req.method === "text.transform") {
       const { mode, instruction, content, previousChapter, maxWords, projectTitle, chapterTitle, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!apiKey || !content && !previousChapter) {
+      if (!hasModelAccess || !content && !previousChapter) {
         return { id: req.id, error: { code: -32602, message: "缺少文本处理所需参数" } };
       }
       if (mode !== "polish" && mode !== "de-ai" && mode !== "continue") {
         return { id: req.id, error: { code: -32602, message: "不支持的文本处理类型" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
@@ -2193,11 +2207,12 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}
     }
     if (req.method === "card.write") {
       const { projectTitle, synopsis, cardType, cardTitle, existingContent, instruction, chapterTitle, chapterContent, outlines, cards, sessionId, previousSessionId, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!projectTitle || !cardType || !apiKey) {
+      if (!projectTitle || !cardType || !hasModelAccess) {
         return { id: req.id, error: { code: -32602, message: "缺少生成卡片所需参数" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-5.5"),
@@ -2261,11 +2276,12 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}
     }
     if (req.method === "outline.write") {
       const { projectTitle, kind, existingContent, instruction, synopsis, cards, knowledgeGraph, worldSetting, skills, preferredSkillNames, sessionId, previousSessionId, outlineId, targetChapter, sourceChapter, formatOutline, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!projectTitle || !kind || !apiKey) {
+      if (!projectTitle || !kind || !hasModelAccess) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
@@ -2386,11 +2402,12 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}
     }
     if (req.method === "chapter.review") {
       const { projectTitle, chapterTitle, content, outline, cards, memory, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
-      if (!projectTitle || !chapterTitle || !content || !apiKey) {
+      if (!projectTitle || !chapterTitle || !content || !hasModelAccess) {
         return { id: req.id, error: { code: -32602, message: "缺少章节审查所需参数" } };
       }
       const client = new ApiSaverClient({
-        apiKey: String(apiKey),
+        apiKey: String(apiKey || ""),
+        provider: String(req.params?.provider || "api") as "api" | "local",
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
@@ -2467,7 +2484,7 @@ ${compactText(content, 26000)}
         sessionId,
         previousSessionId,
       } = req.params ?? {};
-      if (!projectId || !chapterId || !instruction || !apiKey) {
+      if (!projectId || !chapterId || !instruction || !hasModelAccess) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
       const store = StoryStore.inMemory();
@@ -2583,7 +2600,8 @@ ${compactText(content, 26000)}
 
         const graph = createChapterGraph({
           store,
-          apiKey: String(apiKey),
+          provider: String(req.params?.provider || "api") as "api" | "local",
+          apiKey: String(apiKey || ""),
           apiKeys: stringList(apiKeys, 12),
           baseURL: String(baseURL || "https://api.apisaver.com/v1"),
           model: String(model || "gpt-4o-mini"),

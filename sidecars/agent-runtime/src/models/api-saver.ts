@@ -96,6 +96,8 @@ export function createChatModel(config: ApiSaverModelConfig): BaseChatModel {
 
 // Simple client for direct API calls
 export interface ApiSaverClientConfig {
+  /** `api` uses the managed relay; `local` uses an OpenAI-compatible llama.cpp endpoint. */
+  provider?: "api" | "local";
   apiKey: string;
   apiKeys?: string[];
   baseURL?: string;
@@ -251,6 +253,21 @@ const isPrivateOrLocalHost = (hostname: string) => {
   const parts = host.split(".").map(Number);
   return parts.length === 4 && parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31;
 };
+
+function isLocalModelEndpoint(value: string | undefined): boolean {
+  if (!value?.trim()) return false;
+  try {
+    return isPrivateOrLocalHost(new URL(value).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function modelEndpoint(config: ApiSaverClientConfig): string {
+  return isLocalModelEndpoint(config.baseURL)
+    ? trimTrailingSlash(config.baseURL!.trim())
+    : API_SAVER_BASE_URL;
+}
 
 const proxyURLForRequest = (targetURL: string, config: Pick<ApiSaverClientConfig, "proxyEnabled" | "proxyURL" | "proxyBypassLocal">) => {
   if (!config.proxyEnabled || !config.proxyURL?.trim()) return "";
@@ -431,6 +448,18 @@ export class ApiSaverClient {
   }
 
   async listModels(): Promise<string[]> {
+    if (isLocalModelEndpoint(this.config.baseURL)) {
+      const endpoint = `${modelEndpoint(this.config)}/models`;
+      const response = await fetch(endpoint, { headers: { Accept: "application/json" } } as RequestInit);
+      const body = await response.text();
+      if (!response.ok) throw new Error(`本地模型服务请求失败（${response.status}）：${body.slice(0, 180)}`);
+      let payload: { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
+      try { payload = JSON.parse(body) as typeof payload; } catch { throw new Error("本地模型服务返回了无效 JSON"); }
+      const models = Array.from(new Set((payload.data ?? payload.models ?? [])
+        .map(item => typeof item === "string" ? item : item.id)
+        .filter((model): model is string => Boolean(model?.trim()))));
+      return models.length ? models : [this.config.defaultModel || "MiniCPM5-2B"];
+    }
     const endpoint = `${API_SAVER_BASE_URL}/models`;
     const keys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
     if (!keys.length) throw new Error("缺少 API Key");
@@ -518,14 +547,13 @@ export class ApiSaverClient {
     options: ChatOptions = {}
   ): Promise<{ content: string; model: string; usage?: ApiUsage }> {
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
-    const baseURL = API_SAVER_BASE_URL;
-    // All managed ApiSaver models use the verified OpenAI-compatible wire.
-    // A stale settings value must not route a normal write request to a
-    // different endpoint with a different response schema.
+    const local = isLocalModelEndpoint(this.config.baseURL);
+    const baseURL = modelEndpoint(this.config);
+    // Both the managed relay and llama.cpp expose the OpenAI chat-completions wire.
     const apiMode = "openai";
     const contextMessages = limitMessagesToKB(messages, this.config.contextWindowKB);
     const configuredKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-    const apiKeys = await this.keysForModel(configuredKeys, model);
+    const apiKeys = local ? [""] : await this.keysForModel(configuredKeys, model);
     const maxTokens = options.max_tokens ?? 4000;
     const reasoningMode = this.config.reasoningMode;
     const reasoning = supportsOpenAIReasoning(model) && reasoningMode && !["auto", "off"].includes(reasoningMode)
@@ -534,7 +562,7 @@ export class ApiSaverClient {
     let endpoint = `${baseURL}/chat/completions`;
     let headers: Record<string, string> = {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${this.config.apiKey}`,
+      ...(local ? {} : { Authorization: `Bearer ${this.config.apiKey}` }),
     };
     let body: string;
 
@@ -543,10 +571,10 @@ export class ApiSaverClient {
       messages: contextMessages,
       temperature: options.temperature ?? 0.7,
       max_tokens: maxTokens,
-      // Gemini models use this same route but do not consistently implement
-      // response_format. Prompt-level JSON rules remain in place.
-      response_format: supportsOpenAIJsonMode(model) ? options.response_format : undefined,
-      reasoning,
+      // Local llama.cpp endpoints are less uniform about optional OpenAI fields;
+      // prompt-level JSON instructions remain the portable fallback.
+      response_format: !local && supportsOpenAIJsonMode(model) ? options.response_format : undefined,
+      reasoning: !local ? reasoning : undefined,
     });
     const maxAttempts = Math.max(1, Math.min(5, options.retryAttempts ?? 3));
     let lastNetworkError = "";
@@ -555,7 +583,7 @@ export class ApiSaverClient {
       try {
         const requestKey = apiKeys[(attempt - 1) % Math.max(1, apiKeys.length)] || this.config.apiKey;
         const requestHeaders = { ...headers };
-        requestHeaders.Authorization = `Bearer ${requestKey}`;
+        if (!local) requestHeaders.Authorization = `Bearer ${requestKey}`;
         const dispatcher = proxyDispatcherFor(endpoint, this.config);
         const response = await fetch(endpoint, {
           method: "POST",
@@ -610,20 +638,21 @@ export class ApiSaverClient {
     // Never let a stale protocol selection silently degrade writing to a
     // non-streaming request.
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
-    const baseURL = API_SAVER_BASE_URL;
+    const local = isLocalModelEndpoint(this.config.baseURL);
+    const baseURL = modelEndpoint(this.config);
     const endpoint = `${baseURL}/chat/completions`;
     const contextMessages = limitMessagesToKB(messages, this.config.contextWindowKB);
     const dispatcher = proxyDispatcherFor(endpoint, this.config);
     const configuredKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-    const apiKeys = await this.keysForModel(configuredKeys, model);
-    if (!apiKeys.length) throw new Error("缺少 API Key");
+    const apiKeys = local ? [""] : await this.keysForModel(configuredKeys, model);
+    if (!apiKeys.length && !local) throw new Error("缺少 API Key");
     let response: Response | null = null;
     let lastStreamError = "";
     for (const key of apiKeys) {
       const candidate = await fetch(endpoint, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-        body: JSON.stringify({ model, messages: contextMessages, temperature: options.temperature ?? 0.7, max_tokens: options.max_tokens ?? 4000, response_format: supportsOpenAIJsonMode(model) ? options.response_format : undefined, stream: true, stream_options: { include_usage: true } }),
+        headers: { "Content-Type": "application/json", ...(local ? {} : { Authorization: `Bearer ${key}` }) },
+        body: JSON.stringify({ model, messages: contextMessages, temperature: options.temperature ?? 0.7, max_tokens: options.max_tokens ?? 4000, response_format: !local && supportsOpenAIJsonMode(model) ? options.response_format : undefined, stream: true, stream_options: local ? undefined : { include_usage: true } }),
         ...(dispatcher ? { dispatcher } : {}),
       } as RequestInit);
       if (candidate.ok && candidate.body) {

@@ -41,6 +41,27 @@ struct AgentRuntimeState {
     process: Arc<Mutex<Option<AgentRuntimeProcess>>>,
 }
 
+struct LocalModelState {
+    process: Arc<Mutex<Option<Child>>>,
+}
+
+impl Default for LocalModelState {
+    fn default() -> Self {
+        Self { process: Arc::new(Mutex::new(None)) }
+    }
+}
+
+impl Drop for LocalModelState {
+    fn drop(&mut self) {
+        if let Ok(mut process) = self.process.lock() {
+            if let Some(mut child) = process.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
 // save_projects removes and recreates project subdirectories. Serialize every
 // writer so background memory updates cannot race with publishing or backups.
 static PROJECT_SAVE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -291,6 +312,59 @@ fn bundled_agent_resource(name: &str) -> Option<PathBuf> {
         directory.join("agent-runtime").join(name),
     ];
     candidates.into_iter().find(|path| path.exists())
+}
+
+fn bundled_local_model_resource(app: &tauri::AppHandle, name: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        candidates.push(resource_dir.join("local-model").join(name));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runtime/local-model").join(name));
+    candidates.into_iter().find(|path| path.exists())
+}
+
+#[tauri::command]
+fn start_local_model(app: tauri::AppHandle, state: State<'_, LocalModelState>) -> Result<String, String> {
+    if cfg!(any(target_os = "ios", target_os = "android")) {
+        return Err("移动端暂不支持直接启动 llama-server；请使用局域网本地模型或 API 模式".to_string());
+    }
+    let executable_name = if cfg!(target_os = "windows") { "llama-server.exe" } else { "llama-server" };
+    let executable = bundled_local_model_resource(&app, executable_name)
+        .ok_or_else(|| "安装包中没有 llama-server。请使用带本地模型资源的构建命令打包".to_string())?;
+    let model_name = bundled_local_model_resource(&app, "model.json")
+        .and_then(|config| fs::read_to_string(config).ok())
+        .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+        .and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| "MiniCPM5-2B-Q4_K_M.gguf".to_string());
+    let model = bundled_local_model_resource(&app, &model_name)
+        .ok_or_else(|| format!("安装包中没有本地模型权重：{model_name}"))?;
+    let mut process = state.process.lock().map_err(|_| "本地模型进程状态锁定失败".to_string())?;
+    if let Some(child) = process.as_mut() {
+        if child.try_wait().map_err(|error| error.to_string())?.is_none() {
+            return Ok("Local MiniCPM5 model server already running at http://127.0.0.1:8080/v1".to_string());
+        }
+    }
+    *process = None;
+    let model_arg = model.to_string_lossy().into_owned();
+    let child = Command::new(&executable)
+        .args(["-m", model_arg.as_str(), "--host", "127.0.0.1", "--port", "8080", "-c", "4096", "-ngl", "99"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("启动本地 MiniCPM5 模型失败：{error}"))?;
+    *process = Some(child);
+    Ok("Local MiniCPM5 model server started at http://127.0.0.1:8080/v1".to_string())
+}
+
+#[tauri::command]
+fn stop_local_model(state: State<'_, LocalModelState>) -> Result<(), String> {
+    let mut process = state.process.lock().map_err(|_| "本地模型进程状态锁定失败".to_string())?;
+    if let Some(mut child) = process.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    Ok(())
 }
 
 fn app_data_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -1933,8 +2007,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_http::init())
         .manage(AgentRuntimeState::default())
+        .manage(LocalModelState::default())
         .invoke_handler(tauri::generate_handler![
             start_agent_runtime,
+            start_local_model,
+            stop_local_model,
             call_agent_rpc,
             publish_fanqie,
             cloud_sync_status,

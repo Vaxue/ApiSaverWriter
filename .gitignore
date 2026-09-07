@@ -13,6 +13,8 @@ desktop-app/src-tauri/gen/schemas/windows-schema.json
 desktop-app/release-assets/
 desktop-app/output-dev.png
 local-releases/
+local-model-assets/
+*.gguf
 dist/
 *.dmg
 *.app
