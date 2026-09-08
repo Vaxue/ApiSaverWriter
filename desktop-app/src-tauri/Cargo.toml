@@ -23,9 +23,10 @@ serde_json = "1"
 flate2 = "1"
 
 [target.'cfg(target_os = "ios")'.dependencies]
-# Native on-device GGUF inference through Metal. The model is loaded from the
-# bundled local-model resource; no localhost server or LAN is involved.
-llama-cpp-4 = { version = "0.5.0", default-features = false, features = ["metal"] }
+# iOS uses the CPU backend for the first stable native build. Metal is
+# intentionally disabled here because llama-cpp-sys currently emits a
+# Catalyst/macOS runtime object when cross-linking from this CI toolchain.
+llama-cpp-4 = { version = "0.5.0", default-features = false }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # CPU NEON is the conservative Android baseline; Vulkan can be enabled in a

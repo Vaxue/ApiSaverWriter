@@ -393,8 +393,7 @@ fn mobile_local_chat(app: tauri::AppHandle, params: Value) -> Result<Value, Stri
         let model_path = bundled_local_model_resource(&app, "MiniCPM5-2B-Q4_K_M.gguf")
             .ok_or_else(|| "移动端安装包没有 MiniCPM5-2B-Q4_K_M.gguf；请使用带模型资源的移动端构建".to_string())?;
         let backend = LlamaBackend::init().map_err(|error| format!("初始化本地推理后端失败：{error}"))?;
-        let model_params = LlamaModelParams::default()
-            .with_n_gpu_layers(if cfg!(target_os = "ios") { 99 } else { 0 });
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(0);
         let model_params = pin!(model_params);
         let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
             .map_err(|error| format!("加载 MiniCPM5 模型失败：{error}"))?;
