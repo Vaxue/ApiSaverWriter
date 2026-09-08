@@ -90,6 +90,23 @@ jobs:
           set -euo pipefail
           echo "ANDROID_NDK=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
           echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot" >> "$GITHUB_ENV"
+      - name: Configure iOS SDK toolchain
+        if: matrix.kind == 'ios'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang="$(xcrun --sdk iphoneos --find clang)"
+          clangxx="$(xcrun --sdk iphoneos --find clang++)"
+          echo "SDKROOT=$sdk" >> "$GITHUB_ENV"
+          echo "CMAKE_OSX_SYSROOT=$sdk" >> "$GITHUB_ENV"
+          echo "CMAKE_SYSTEM_NAME=iOS" >> "$GITHUB_ENV"
+          echo "CMAKE_OSX_ARCHITECTURES=arm64" >> "$GITHUB_ENV"
+          echo "CMAKE_OSX_DEPLOYMENT_TARGET=16.0" >> "$GITHUB_ENV"
+          echo "CC=$clang" >> "$GITHUB_ENV"
+          echo "CXX=$clangxx" >> "$GITHUB_ENV"
+          echo "CFLAGS=-isysroot $sdk -miphoneos-version-min=16.0" >> "$GITHUB_ENV"
+          echo "CXXFLAGS=-isysroot $sdk -miphoneos-version-min=16.0" >> "$GITHUB_ENV"
       - name: Prepare packaged runtime resources
         shell: bash
         env:
@@ -125,7 +142,11 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           find desktop-app/src-tauri/target -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.apk' -o -name '*.aab' \) -exec cp {} release-assets/ \;
-          find desktop-app/src-tauri/gen/apple/build -type d -name '*.xcarchive' -print -quit > "$RUNNER_TEMP/archive.txt" || true
+          if [ -d desktop-app/src-tauri/gen/apple/build ]; then
+            find desktop-app/src-tauri/gen/apple/build -type d -name '*.xcarchive' -print -quit > "$RUNNER_TEMP/archive.txt" || true
+          else
+            : > "$RUNNER_TEMP/archive.txt"
+          fi
           archive="$(cat "$RUNNER_TEMP/archive.txt" 2>/dev/null || true)"
           if [ -n "$archive" ] && [ -d "$archive/Products/Applications" ]; then
             mkdir -p ios-package/Payload
