@@ -99,6 +99,17 @@ jobs:
         run: |
           yes | sdkmanager --licenses
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+      - name: Download MiniCPM5 model for Android native inference
+        if: matrix.kind == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/local-model"
+          curl -L --fail --retry 5 --retry-delay 3 --continue-at - \
+            "https://modelscope.cn/models/OpenBMB/MiniCPM5-2B-GGUF/resolve/master/MiniCPM5-2B-Q4_K_M.gguf" \
+            -o "$RUNNER_TEMP/local-model/MiniCPM5-2B-Q4_K_M.gguf"
+          echo "APISAVERWRITER_LOCAL_MODEL=$RUNNER_TEMP/local-model/MiniCPM5-2B-Q4_K_M.gguf" >> "$GITHUB_ENV"
+          echo "APISAVERWRITER_BUNDLE_LOCAL_MODEL=1" >> "$GITHUB_ENV"
       - name: Build Android
         if: matrix.kind == 'android'
         working-directory: desktop-app
@@ -144,6 +155,17 @@ jobs:
           : "${ANDROID_KEY_PASSWORD:=apisaverwriter-ci}"
           export ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD
           scripts/package-android-release.sh release-assets "${{ inputs.release_tag || github.ref_name }}"
+      - name: Download MiniCPM5 model for iOS native inference
+        if: matrix.kind == 'ios'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/local-model"
+          curl -L --fail --retry 5 --retry-delay 3 --continue-at - \
+            "https://modelscope.cn/models/OpenBMB/MiniCPM5-2B-GGUF/resolve/master/MiniCPM5-2B-Q4_K_M.gguf" \
+            -o "$RUNNER_TEMP/local-model/MiniCPM5-2B-Q4_K_M.gguf"
+          echo "APISAVERWRITER_LOCAL_MODEL=$RUNNER_TEMP/local-model/MiniCPM5-2B-Q4_K_M.gguf" >> "$GITHUB_ENV"
+          echo "APISAVERWRITER_BUNDLE_LOCAL_MODEL=1" >> "$GITHUB_ENV"
       - name: Build unsigned iOS archive
         if: matrix.kind == 'ios'
         working-directory: desktop-app
