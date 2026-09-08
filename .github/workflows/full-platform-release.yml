@@ -177,6 +177,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           find desktop-app/src-tauri/target -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' \) -exec cp {} release-assets/ \;
+          tag="${{ inputs.release_tag || github.ref_name }}"
           if [ -d desktop-app/src-tauri/gen/apple/build ]; then
             find desktop-app/src-tauri/gen/apple/build -type d -name '*.xcarchive' -print -quit > "$RUNNER_TEMP/archive.txt" || true
           else
