@@ -36,3 +36,9 @@ llama-cpp-4 = { version = "0.5.0", default-features = false }
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+# The published llama-cpp-sys-4 0.5.1 adds clang_rt.osx even for iOS,
+# which makes Xcode reject the final arm64 iPhoneOS link. This local patch
+# keeps iOS framework links but omits the macOS/Catalyst runtime archive.
+[patch.crates-io]
+llama-cpp-sys-4 = { path = "../../vendor/llama-cpp-sys-4" }

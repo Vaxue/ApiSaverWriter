@@ -73,12 +73,6 @@ jobs:
           npm run prepare:local-model --prefix desktop-app
       - name: Build unsigned iOS archive
         working-directory: desktop-app
-        env:
-          CMAKE_SYSTEM_NAME: iOS
-          CMAKE_OSX_SYSROOT: iphoneos
-          CMAKE_OSX_ARCHITECTURES: arm64
-          SDKROOT: iphoneos
-          IPHONEOS_DEPLOYMENT_TARGET: '16.0'
         run: |
           set -euo pipefail
           npx tauri ios init --ci
