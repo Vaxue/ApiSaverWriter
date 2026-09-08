@@ -7,5 +7,7 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>ApiSaverWriter 需要访问局域网中的本地模型服务以进行免费离线写作。</string>
 </dict>
 </plist>
