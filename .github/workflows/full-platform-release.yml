@@ -83,6 +83,21 @@ jobs:
           server="$(find "$RUNNER_TEMP/llama-build" -type f \( -name llama-server -o -name llama-server.exe \) -print -quit)"
           test -n "$server"
           echo "APISAVERWRITER_LLAMA_SERVER=$server" >> "$GITHUB_ENV"
+      - name: Configure Android bindgen sysroot
+        if: matrix.kind == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ANDROID_NDK=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
+          echo "BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android=--sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot" >> "$GITHUB_ENV"
+      - name: Prepare packaged runtime resources
+        shell: bash
+        env:
+          TAURI_ENV_PLATFORM: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          npm run prepare:agent-runtime --prefix desktop-app
+          npm run prepare:local-model --prefix desktop-app
       - name: Build Windows
         if: matrix.kind == 'windows'
         run: npm run tauri:build --prefix desktop-app
