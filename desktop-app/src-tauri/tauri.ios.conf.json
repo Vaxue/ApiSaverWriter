@@ -1,6 +1,8 @@
 {
   "bundle": {
-    "resources": [],
+    "resources": {
+      "runtime/local-model": "local-model"
+    },
     "iOS": { "minimumSystemVersion": "16.0" }
   }
 }

@@ -798,7 +798,15 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   const local = provider === 'local';
   // Local mobile mode talks to a llama.cpp/Ollama OpenAI-compatible server on
   // the device or the same LAN. It deliberately never sends an API key.
-  const model = stringValue(params.model, local ? 'MiniCPM5-2B' : 'gpt-4o-mini');
+  const model = stringValue(params.model, local ? 'MiniCPM5-2B-Q4_K_M' : 'gpt-4o-mini');
+  if (local) {
+    const nativeResult = await nativeInvoke<{ content?: string; usage?: unknown }>('mobile_local_chat', {
+      params: { messages, max_tokens: jsonMode ? 1300 : 6000, temperature: jsonMode ? 0.2 : 0.7, contextWindow: params.contextWindow || 4096 },
+    });
+    const content = stringValue(nativeResult?.content);
+    if (content && onChunk) onChunk(content);
+    return { content, usage: nativeResult?.usage };
+  }
   // ApiSaver's Gemini-compatible routes can reject OpenAI's response_format
   // option upstream. The prompt still asks for JSON, so parsing remains safe.
   const supportsJsonMode = !/^gemini(?:[-:/]|$)/iu.test(model.trim());
@@ -1479,7 +1487,8 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
   }
   if (method === 'models.list') {
     const local = stringValue(params.provider, 'api') === 'local';
-    const keys = local ? [''] : Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
+    if (local) return nativeInvoke<T>('mobile_local_models');
+    const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
     if (!keys.length && !local) throw new Error('请先在设置中填写 API Key。');
     const endpoint = `${baseURL(params.baseURL, local ? 'local' : 'api')}/models`;
     const responses = await Promise.allSettled(keys.map(async key => {
@@ -1557,7 +1566,7 @@ export const invoke = async <T>(command: string, args?: InvokeArgs): Promise<T> 
   }
   if (!mobileRuntime()) return nativeInvoke<T>(command, args);
   if (command === 'start_agent_runtime') return 'Mobile direct Agent ready' as T;
-  if (command === 'start_local_model') return 'Mobile local model endpoint ready; start llama-server on this device or the same LAN' as T;
+  if (command === 'start_local_model') return 'Mobile native MiniCPM5 model ready' as T;
   if (command === 'stop_local_model') return undefined as T;
   if (command === 'call_agent_rpc') {
     const input = args as { method?: string; params?: MobileParams } | undefined;

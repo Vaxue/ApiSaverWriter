@@ -367,6 +367,94 @@ fn stop_local_model(state: State<'_, LocalModelState>) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn mobile_local_models(app: tauri::AppHandle) -> Result<Value, String> {
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    {
+        let _model = bundled_local_model_resource(&app, "MiniCPM5-2B-Q4_K_M.gguf")
+            .ok_or_else(|| "移动端安装包没有 MiniCPM5-2B-Q4_K_M.gguf；请使用带模型资源的移动端构建".to_string())?;
+        return Ok(serde_json::json!({ "models": ["MiniCPM5-2B-Q4_K_M"] }));
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    {
+        let _ = app;
+        Err("mobile_local_models 仅用于 iOS/Android 原生推理".to_string())
+    }
+}
+
+#[tauri::command]
+fn mobile_local_chat(app: tauri::AppHandle, params: Value) -> Result<Value, String> {
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    {
+        use llama_cpp_4::prelude::*;
+        use std::num::NonZeroU32;
+        use std::pin::pin;
+
+        let model_path = bundled_local_model_resource(&app, "MiniCPM5-2B-Q4_K_M.gguf")
+            .ok_or_else(|| "移动端安装包没有 MiniCPM5-2B-Q4_K_M.gguf；请使用带模型资源的移动端构建".to_string())?;
+        let backend = LlamaBackend::init().map_err(|error| format!("初始化本地推理后端失败：{error}"))?;
+        let model_params = LlamaModelParams::default()
+            .with_n_gpu_layers(if cfg!(target_os = "ios") { 99 } else { 0 });
+        let model_params = pin!(model_params);
+        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
+            .map_err(|error| format!("加载 MiniCPM5 模型失败：{error}"))?;
+
+        let raw_messages = params.get("messages").and_then(Value::as_array)
+            .ok_or_else(|| "本地模型请求缺少 messages".to_string())?;
+        let mut chat_messages = Vec::new();
+        for raw in raw_messages {
+            let role = raw.get("role").and_then(Value::as_str).unwrap_or("user");
+            let content = raw.get("content").and_then(Value::as_str).unwrap_or("");
+            chat_messages.push(LlamaChatMessage::new(role.to_string(), content.to_string())
+                .map_err(|error| format!("构造聊天消息失败：{error}"))?);
+        }
+        let prompt = model.apply_chat_template(None, chat_messages, true)
+            .map_err(|error| format!("应用 MiniCPM5 对话模板失败：{error}"))?;
+        let tokens = model.str_to_token(&prompt, AddBos::Always)
+            .map_err(|error| format!("本地模型分词失败：{error}"))?;
+        let context_size = params.get("contextWindow").and_then(Value::as_u64).unwrap_or(4096).clamp(1024, 8192) as u32;
+        let max_tokens = params.get("max_tokens").and_then(Value::as_u64).unwrap_or(1536).clamp(1, 4096) as usize;
+        let context_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(context_size))
+            .with_n_batch(512);
+        let mut context = model.new_context(&backend, context_params)
+            .map_err(|error| format!("创建本地推理上下文失败：{error}"))?;
+        let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
+        for (index, token) in tokens.iter().enumerate() {
+            batch.add(*token, index as i32, &[0], index + 1 == tokens.len())
+                .map_err(|error| format!("准备本地模型输入失败：{error}"))?;
+        }
+        context.decode(&mut batch).map_err(|error| format!("本地模型预填充失败：{error}"))?;
+        let temperature = params.get("temperature").and_then(Value::as_f64).unwrap_or(0.7).clamp(0.05, 1.5) as f32;
+        let sampler = LlamaSampler::chain_simple([
+            LlamaSampler::top_k(40),
+            LlamaSampler::top_p(0.95, 1),
+            LlamaSampler::temp(temperature),
+            LlamaSampler::dist(42),
+        ]);
+        let mut output = String::new();
+        let mut position = tokens.len() as i32;
+        for _ in 0..max_tokens {
+            let token = sampler.sample(&context, batch.n_tokens() - 1);
+            if model.is_eog_token(token) { break; }
+            let bytes = model.token_to_bytes(token, Special::Plaintext)
+                .map_err(|error| format!("解码本地模型输出失败：{error}"))?;
+            output.push_str(&String::from_utf8_lossy(&bytes));
+            batch.clear();
+            batch.add(token, position, &[0], true)
+                .map_err(|error| format!("准备本地模型下一步输入失败：{error}"))?;
+            context.decode(&mut batch).map_err(|error| format!("本地模型生成失败：{error}"))?;
+            position += 1;
+        }
+        return Ok(serde_json::json!({ "content": output, "model": "MiniCPM5-2B-Q4_K_M" }));
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    {
+        let _ = (app, params);
+        Err("mobile_local_chat 仅用于 iOS/Android 原生推理".to_string())
+    }
+}
+
 fn app_data_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .path()
@@ -2012,6 +2100,8 @@ pub fn run() {
             start_agent_runtime,
             start_local_model,
             stop_local_model,
+            mobile_local_models,
+            mobile_local_chat,
             call_agent_rpc,
             publish_fanqie,
             cloud_sync_status,

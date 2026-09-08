@@ -17,7 +17,16 @@ mkdirSync(runtimeRoot, { recursive: true });
 writeFileSync(join(runtimeRoot, 'README.txt'), 'Generated local model resources. See LOCAL_MODEL.md.\\n');
 
 if (mobileTarget) {
-  console.log(`Skipping llama-server bundle for ${process.env.TAURI_ENV_PLATFORM}; mobile requires native Metal/Vulkan integration.`);
+  if (!modelSource) {
+    const message = '移动端构建未提供 APISAVERWRITER_LOCAL_MODEL；将生成仅 API 模式的移动包。';
+    if (required) throw new Error(message);
+    console.warn(message);
+    process.exit(0);
+  }
+  if (!existsSync(modelSource)) throw new Error(`本地模型不存在：${modelSource}`);
+  copyFileSync(modelSource, join(runtimeRoot, modelName));
+  writeFileSync(join(runtimeRoot, 'model.json'), JSON.stringify({ model: modelName, context: Number(process.env.APISAVERWRITER_LOCAL_CONTEXT || 4096) }, null, 2));
+  console.log(`Mobile native model resource copied without symlinks: ${runtimeRoot}`);
   process.exit(0);
 }
 

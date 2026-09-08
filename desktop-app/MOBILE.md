@@ -10,12 +10,26 @@ Android 与 iOS 不启动桌面 Node 子进程，直接通过 Tauri 原生 HTTP 
 
 ## 移动端本地模型
 
-Android/iOS 已支持选择“本地免费”并通过原生 HTTP 通道连接 OpenAI 兼容的 llama.cpp/Ollama 服务。移动端不能像桌面端那样直接启动 `llama-server` 子进程：iOS 不允许 App 执行随包二进制，Android 也不能复用桌面 Linux/Windows/macOS 二进制。因此移动端当前支持两种实际部署方式：
+iOS/Android 现在支持将 `MiniCPM5-2B-Q4_K_M.gguf` 直接作为 Tauri mobile 资源打包，并通过 Rust 原生 `llama-cpp-4` 在设备内部推理：
 
-1. **同一局域网电脑运行 llama-server**：把设置里的本地地址改为电脑局域网地址，例如 `http://192.168.1.20:8080/v1`；手机不需要 API Key，小说内容通过局域网访问本地服务。
-2. **原生端内置推理（后续移动原生构建阶段）**：需要把 llama.cpp 编译为 iOS Metal / Android NDK-Vulkan 原生库，并接入 Tauri mobile plugin；不能把桌面 `llama-server` 二进制直接塞进移动包。
+- iOS：llama.cpp Metal 后端
+- Android：llama.cpp CPU/NEON 基线后端
+- 手机不需要局域网电脑、不需要 API Key、不启动 `llama-server`
+- 本地模型请求通过 Tauri command 进入原生推理，不经过 HTTP
 
-移动端的“本地免费”模式已经支持本地地址、免 Key、模型列表、测试、流式聊天和 Agent 写作请求。iOS 已声明本地网络用途；Android/iOS 构建仍需在各自原生工具链上完成。
+移动端资源构建需要提前提供模型文件：
+
+```bash
+export APISAVERWRITER_BUNDLE_LOCAL_MODEL=1
+export APISAVERWRITER_LOCAL_MODEL=/absolute/path/MiniCPM5-2B-Q4_K_M.gguf
+npm run android:build --prefix desktop-app
+# 或
+npm run ios:build --prefix desktop-app
+```
+
+注意：1.56GB GGUF 会显著增大 APK/IPA，Android 发布包更适合使用 Play Asset Pack；iOS 需要在真实设备上验证 App 内存限制。当前移动端原生实现按请求加载模型并返回完整结果，章节正文流式体验会在原生推理稳定后再改为 token event 流。
+
+如果不把模型打进移动包，仍可以切换到 API 付费模式；桌面端继续使用 `llama-server` 资源方案。
 
 
 Android 需要 Android SDK、NDK、JDK，并设置 `ANDROID_HOME`（或 `ANDROID_SDK_ROOT`）。
