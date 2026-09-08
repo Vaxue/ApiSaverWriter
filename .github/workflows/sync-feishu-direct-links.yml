@@ -1,10 +1,6 @@
 name: Sync direct v0.1.7 download links to Feishu
 
-on:
-  push:
-    paths:
-      - '.github/workflows/sync-feishu-direct-links.yml'
-  workflow_dispatch:
+on: [push, workflow_dispatch]
 
 permissions:
   contents: read
