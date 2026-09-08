@@ -2155,8 +2155,16 @@ fn main() {
         config.define("GGML_METAL", "OFF");
     }
 
+    // iPhoneOS builds use the portable ARM CPU kernels. The upstream default
+    // enables Accelerate whenever CMake sees APPLE, but the dependency is
+    // linked as a static archive into Tauri's Xcode target and its transitive
+    // framework flag is not propagated. Disable it on iOS to avoid unresolved
+    // vDSP symbols while retaining the native llama.cpp CPU implementation.
+    if target.contains("apple-ios") {
+        config.define("GGML_ACCELERATE", "OFF");
+    }
+
     if cfg!(feature = "webgpu") {
-        config.define("GGML_WEBGPU", "ON");
     } else {
         config.define("GGML_WEBGPU", "OFF");
     }
