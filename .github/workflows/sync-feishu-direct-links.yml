@@ -1,0 +1,62 @@
+name: Sync direct v0.1.7 download links to Feishu
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Sync GitHub download pages
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_DOC_URL: https://plwenpndps.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa
+          FEISHU_AS: bot
+        run: |
+          set -euo pipefail
+          if [ -z "$FEISHU_APP_ID" ] || [ -z "$FEISHU_APP_SECRET" ]; then
+            echo 'FEISHU_APP_ID/FEISHU_APP_SECRET 未配置，无法自动更新飞书文档。'
+            exit 1
+          fi
+          npm install -g @larksuite/cli@1.0.89
+          printf '%s' "$FEISHU_APP_SECRET" | lark-cli profile add --name apisaverwriter-release --app-id "$FEISHU_APP_ID" --app-secret-stdin
+          content=$(cat <<'EOF'
+
+## v0.1.7 安装包下载入口
+
+安装包内置 MiniCPM5-2B Q4_K_M 本地模型，每个平台约 1.5GB，请保持网络稳定并预留足够空间。
+
+### Windows / macOS / Android
+- [打开 GitHub 全平台下载页](https://github.com/Vaxue/ApiSaverWriter/actions/runs/34200511897)
+- 在页面底部 Artifacts 下载对应平台：windows-x64、macos-arm64、macos-x64、android-arm64。
+
+### iOS
+- [打开 GitHub iOS 下载页](https://github.com/Vaxue/ApiSaverWriter/actions/runs/34194757193)
+- 在页面底部 Artifacts 下载 ios-v0.1.7-native-local-model。
+
+### 安装包大小
+- Windows：约 1.56GB
+- macOS Apple Silicon：约 1.61GB
+- macOS Intel：约 1.61GB
+- Android APK：约 1.57GB
+- Android AAB：约 1.55GB
+- iOS IPA：约 1.54GB
+
+> 以上链接直接指向 GitHub 下载页面，不重复上传安装包到飞书。
+EOF
+)
+          existing=$(lark-cli docs +fetch --as "$FEISHU_AS" --doc "$FEISHU_DOC_URL" --doc-format markdown --scope full --detail simple 2>/dev/null || true)
+          if printf '%s' "$existing" | grep -q 'v0.1.7 安装包下载入口'; then
+            echo '飞书文档已存在 v0.1.7 直链，跳过重复追加。'
+          else
+            printf '%s' "$content" | lark-cli docs +update --as "$FEISHU_AS" --doc "$FEISHU_DOC_URL" --command append --doc-format markdown --content -
+            echo '已将 GitHub 直链和安装包大小同步到飞书。'
+          fi
