@@ -31,18 +31,64 @@ jobs:
       - name: Download verified Windows/macOS/Android artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_RUN: ${{ inputs.source_run }}
         run: |
           set -euo pipefail
           mkdir -p release-assets/source release-assets/ios
-          for artifact in windows-x64 macos-x64 macos-arm64 android-arm64; do
-            gh run download "${{ inputs.source_run }}" --repo "${{ github.repository }}" --name "$artifact" --dir "release-assets/source/$artifact"
-          done
+          download_artifact() {
+            name="$1"
+            outdir="release-assets/source/$name"
+            mkdir -p "$outdir"
+            artifact_url="$(gh api "repos/${{ github.repository }}/actions/runs/$SOURCE_RUN/artifacts" --paginate --jq ".artifacts[] | select(.name == \"$name\") | .archive_download_url" | head -n1)"
+            test -n "$artifact_url"
+            zipfile="$RUNNER_TEMP/$name.zip"
+            : > "$zipfile"
+            ok=0
+            for attempt in $(seq 1 12); do
+              echo "下载 $name，第 $attempt/12 次（支持断点续传）"
+              if curl -fL --retry 3 --retry-all-errors --retry-delay 8 -C - \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H 'Accept: application/vnd.github+json' \
+                "$artifact_url" -o "$zipfile"; then
+                ok=1
+                break
+              fi
+              sleep 10
+            done
+            test "$ok" = 1
+            unzip -q "$zipfile" -d "$outdir"
+          }
+          download_artifact windows-x64
+          download_artifact macos-x64
+          download_artifact macos-arm64
+          download_artifact android-arm64
       - name: Download verified iOS artifact
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IOS_RUN: ${{ inputs.ios_run }}
         run: |
           set -euo pipefail
-          gh run download "${{ inputs.ios_run }}" --repo "${{ github.repository }}" --name ios-v0.1.7-native-local-model --dir release-assets/ios
+          name='ios-v0.1.7-native-local-model'
+          outdir='release-assets/ios'
+          mkdir -p "$outdir"
+          artifact_url="$(gh api "repos/${{ github.repository }}/actions/runs/$IOS_RUN/artifacts" --paginate --jq ".artifacts[] | select(.name == \"$name\") | .archive_download_url" | head -n1)"
+          test -n "$artifact_url"
+          zipfile="$RUNNER_TEMP/ios.zip"
+          : > "$zipfile"
+          ok=0
+          for attempt in $(seq 1 12); do
+            echo "下载 iOS，第 $attempt/12 次（支持断点续传）"
+            if curl -fL --retry 3 --retry-all-errors --retry-delay 8 -C - \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              "$artifact_url" -o "$zipfile"; then
+              ok=1
+              break
+            fi
+            sleep 10
+          done
+          test "$ok" = 1
+          unzip -q "$zipfile" -d "$outdir"
       - name: Flatten and validate packages
         shell: bash
         run: |
