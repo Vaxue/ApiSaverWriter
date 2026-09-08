@@ -1,0 +1,82 @@
+name: Publish v0.1.7 From Verified Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag
+        required: true
+        default: v0.1.7
+      source_run:
+        description: Verified desktop/mobile build run
+        required: true
+        default: '34200511897'
+      ios_run:
+        description: Verified iOS build run
+        required: true
+        default: '34194757193'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Download verified Windows/macOS/Android artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets/source release-assets/ios
+          for artifact in windows-x64 macos-x64 macos-arm64 android-arm64; do
+            gh run download "${{ inputs.source_run }}" --repo "${{ github.repository }}" --name "$artifact" --dir "release-assets/source/$artifact"
+          done
+      - name: Download verified iOS artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ inputs.ios_run }}" --repo "${{ github.repository }}" --name ios-v0.1.7-native-local-model --dir release-assets/ios
+      - name: Flatten and validate packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          find release-assets/source -type f -exec cp {} release-assets/ \;
+          find release-assets/ios -type f -exec cp {} release-assets/ \;
+          rm -rf release-assets/source release-assets/ios
+          echo 'Published files:'
+          find release-assets -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -ge 6
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "${{ inputs.release_tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "${{ inputs.release_tag }}" --repo "${{ github.repository }}" --title "${{ inputs.release_tag }}" --notes "ApiSaverWriter ${{ inputs.release_tag }} 全平台安装包"
+          gh release upload "${{ inputs.release_tag }}" --repo "${{ github.repository }}" release-assets/* --clobber
+      - name: Sync download links to Feishu
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_DOC_URL: https://plwenpndps.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa
+          FEISHU_AS: bot
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DOWNLOAD_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FEISHU_APP_ID" ] || [ -z "$FEISHU_APP_SECRET" ]; then
+            echo '飞书应用密钥未配置，GitHub Release 已完成；跳过飞书同步。'
+            exit 0
+          fi
+          npm install -g @larksuite/cli@1.0.89
+          printf '%s' "$FEISHU_APP_SECRET" | lark-cli profile add --name apisaverwriter-release --app-id "$FEISHU_APP_ID" --app-secret-stdin
+          npm run sync:feishu-release
