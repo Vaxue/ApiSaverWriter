@@ -408,7 +408,7 @@ fn mobile_local_chat(app: tauri::AppHandle, params: Value) -> Result<Value, Stri
             chat_messages.push(LlamaChatMessage::new(role.to_string(), content.to_string())
                 .map_err(|error| format!("构造聊天消息失败：{error}"))?);
         }
-        let prompt = model.apply_chat_template(None, chat_messages, true)
+        let prompt = model.apply_chat_template(None, &chat_messages, true)
             .map_err(|error| format!("应用 MiniCPM5 对话模板失败：{error}"))?;
         let tokens = model.str_to_token(&prompt, AddBos::Always)
             .map_err(|error| format!("本地模型分词失败：{error}"))?;
