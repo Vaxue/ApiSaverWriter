@@ -2,6 +2,16 @@
 
 All notable changes to ApiSaverWriter will be documented in this file.
 
+## [0.1.7] - 2026-09-08
+
+### 本地模型与全平台
+
+- 新增 MiniCPM5-2B Q4_K_M 本地免费模式。
+- Windows、macOS、Linux 桌面端支持将 `llama-server` 与 GGUF 权重复制进 Tauri 安装包，不使用软链接。
+- iOS 使用 llama.cpp Metal 原生推理，Android 使用 llama.cpp CPU/NEON 原生推理。
+- 移动端本地模式不依赖局域网电脑、不需要 API Key；API 付费模式继续保留。
+- GitHub Actions 增加全平台本地模型资源构建流程。
+
 ## [0.1.6] - 2026-09-04
 
 ### 修复与优化
