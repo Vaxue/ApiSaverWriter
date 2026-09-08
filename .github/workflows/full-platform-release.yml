@@ -136,12 +136,47 @@ jobs:
         run: |
           npx tauri ios init --ci
           npm run ios:build -- --target aarch64 --ci --no-sign --archive-only
+      - name: Restore Android release signing key
+        if: matrix.kind == 'android'
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/apisaverwriter-release.jks"
+          else
+            keytool -genkeypair -noprompt \
+              -keystore "$RUNNER_TEMP/apisaverwriter-release.jks" \
+              -storepass apisaverwriter-ci \
+              -keypass apisaverwriter-ci \
+              -alias apisaverwriter \
+              -keyalg RSA -keysize 2048 -validity 3650 \
+              -dname "CN=ApiSaverWriter,O=ApiSaverWriter,C=CN"
+          fi
+      - name: Sign Android release assets
+        if: matrix.kind == 'android'
+        shell: bash
+        env:
+          ANDROID_BUILD_TOOLS_VERSION: 35.0.0
+          ANDROID_VERSION_CODE: 14
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/apisaverwriter-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${ANDROID_KEYSTORE_PASSWORD:=apisaverwriter-ci}"
+          : "${ANDROID_KEY_ALIAS:=apisaverwriter}"
+          : "${ANDROID_KEY_PASSWORD:=apisaverwriter-ci}"
+          export ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD
+          scripts/package-android-release.sh release-assets "${{ inputs.release_tag || github.ref_name }}"
       - name: Collect artifacts
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          find desktop-app/src-tauri/target -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.apk' -o -name '*.aab' \) -exec cp {} release-assets/ \;
+          find desktop-app/src-tauri/target -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' \) -exec cp {} release-assets/ \;
           if [ -d desktop-app/src-tauri/gen/apple/build ]; then
             find desktop-app/src-tauri/gen/apple/build -type d -name '*.xcarchive' -print -quit > "$RUNNER_TEMP/archive.txt" || true
           else
@@ -152,7 +187,7 @@ jobs:
             mkdir -p ios-package/Payload
             app="$(find "$archive/Products/Applications" -maxdepth 1 -type d -name '*.app' -print -quit)"
             cp -R "$app" ios-package/Payload/
-            (cd ios-package && zip -qry "../release-assets/ApiSaverWriter_${{ github.ref_name }}_iOS_unsigned.ipa" Payload)
+            (cd ios-package && zip -qry "../release-assets/ApiSaverWriter_${tag}_iOS_unsigned.ipa" Payload)
           fi
           test -n "$(find release-assets -type f -print -quit)"
       - uses: actions/upload-artifact@v4
@@ -168,7 +203,7 @@ jobs:
         with: { path: release-assets, merge-multiple: true }
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           generate_release_notes: true
           files: release-assets/*
       - name: Sync packages to Feishu
@@ -177,7 +212,7 @@ jobs:
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_DOC_URL: https://plwenpndps.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa
           FEISHU_AS: bot
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           DOWNLOAD_REPOSITORY: ${{ github.repository }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
