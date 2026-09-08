@@ -50,9 +50,16 @@ jobs:
           find release-assets/source -type f -exec cp {} release-assets/ \;
           find release-assets/ios -type f -exec cp {} release-assets/ \;
           rm -rf release-assets/source release-assets/ios
+          # Only publish user-facing installers; never upload build intermediates,
+          # sidecars, Rust build scripts, or the developer xcarchive bundle.
+          keep='ApiSaverWriter_0.1.7_aarch64.dmg ApiSaverWriter_0.1.7_x64.dmg ApiSaverWriter_0.1.7_x64-setup.exe ApiSaverWriter_0.1.7_x64_en-US.msi ApiSaverWriter_v0.1.7_Android_arm64.apk ApiSaverWriter_v0.1.7_Android_arm64.aab ApiSaverWriter_iOS_v0.1.7_unsigned.ipa'
+          for file in release-assets/*; do
+            [ -f "$file" ] || continue
+            case " $keep " in *" $(basename "$file") "*) ;; *) rm -f "$file" ;; esac
+          done
           echo 'Published files:'
           find release-assets -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
-          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -ge 6
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 7
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
