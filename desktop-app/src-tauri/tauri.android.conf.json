@@ -1,8 +1,6 @@
 {
   "bundle": {
-    "resources": {
-      "runtime/local-model": "local-model"
-    },
+    "resources": [],
     "android": { "minSdkVersion": 26, "versionCode": 14 }
   }
 }

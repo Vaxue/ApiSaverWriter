@@ -7,7 +7,6 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "prepare:agent-runtime": "node ./scripts/prepare-agent-runtime.mjs",
-    "prepare:local-model": "node ./scripts/prepare-local-model.mjs",
     "agent:gateway": "npm --prefix ../sidecars/agent-runtime run gateway",
     "mobile:init": "node ./scripts/mobile-targets.mjs",
     "android:build": "tauri android build",

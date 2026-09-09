@@ -59,11 +59,9 @@ const memoryList = (value: unknown, limit = 40): string[] => {
   }).filter(Boolean).slice(0, limit);
 };
 const isQuotaExceeded = (value: string) => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/iu.test(value);
-const baseURL = (value: unknown, provider?: unknown) => {
-  const candidate = stringValue(value).trim().replace(/\/+$/u, '');
-  if (provider === 'local' && /^(?:https?:\/\/)(?:localhost|127\.0\.0\.1|\[::1\]|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[0-1])\.)/iu.test(candidate)) {
-    return candidate.endsWith('/v1') ? candidate : `${candidate}/v1`;
-  }
+const baseURL = (value: unknown) => {
+  // Mobile clients use the managed ApiSaver gateway only. Ignore legacy
+  // custom values restored from older app versions.
   return 'https://api.apisaver.com/v1';
 };
 
@@ -794,44 +792,29 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   const fetcher = await httpFetch();
   // Keep mobile on the same verified OpenAI-compatible wire as desktop.
   const apiMode = 'openai';
-  const provider = stringValue(params.provider, 'api');
-  const local = provider === 'local';
-  // Local mobile mode talks to a llama.cpp/Ollama OpenAI-compatible server on
-  // the device or the same LAN. It deliberately never sends an API key.
-  const model = stringValue(params.model, local ? 'MiniCPM5-2B-Q4_K_M' : 'gpt-4o-mini');
-  if (local) {
-    const nativeResult = await nativeInvoke<{ content?: string; usage?: unknown }>('mobile_local_chat', {
-      // iOS/Android native inference is memory constrained; the Rust bridge
-      // applies the same hard limits and truncates oversized prompts safely.
-      params: { messages, max_tokens: jsonMode ? 768 : 1024, temperature: jsonMode ? 0.2 : 0.7, contextWindow: Math.min(params.contextWindow || 2048, 2048) },
-    });
-    const content = stringValue(nativeResult?.content);
-    if (content && onChunk) onChunk(content);
-    return { content, usage: nativeResult?.usage };
-  }
+  const model = stringValue(params.model, 'gpt-4o-mini');
   // ApiSaver's Gemini-compatible routes can reject OpenAI's response_format
   // option upstream. The prompt still asks for JSON, so parsing remains safe.
   const supportsJsonMode = !/^gemini(?:[-:/]|$)/iu.test(model.trim());
   const configuredKeys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
-  const knownModelKeys = local ? [] : configuredKeys.filter(key => mobileModelsByApiKey.get(key)?.has(model));
-  const allKeysKnown = !local && configuredKeys.length > 0 && configuredKeys.every(key => mobileModelsByApiKey.has(key));
+  const knownModelKeys = configuredKeys.filter(key => mobileModelsByApiKey.get(key)?.has(model));
+  const allKeysKnown = configuredKeys.length > 0 && configuredKeys.every(key => mobileModelsByApiKey.has(key));
   if (!knownModelKeys.length && allKeysKnown) throw new Error(`当前配置的 API Key 都不支持模型 ${model}。请重新拉取模型并选择该模型对应的 API Key。`);
-  const keys = local ? [''] : (knownModelKeys.length ? knownModelKeys : configuredKeys);
-  if (!keys.length && !local) throw new Error('请先在设置中填写 API Key。');
-  const base = baseURL(params.baseURL, provider);
-  if (local && !base.startsWith('http://') && !base.startsWith('https://')) throw new Error('本地模型地址必须是 http:// 或 https:// 地址');
+  const keys = knownModelKeys.length ? knownModelKeys : configuredKeys;
+  if (!keys.length) throw new Error('请先在设置中填写 API Key。');
+  const base = baseURL(params.baseURL);
   let endpoint = `${base}/chat/completions`;
   let body: Record<string, unknown>;
   const maxTokens = jsonMode ? 1300 : 6000;
   const temperature = jsonMode ? 0.2 : 0.7;
   const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: onChunk ? 'text/event-stream' : 'application/json' };
-  body = { model, messages, temperature, max_tokens: maxTokens, stream: Boolean(onChunk), ...(onChunk && !local ? { stream_options: { include_usage: true } } : {}), ...(jsonMode && !local && supportsJsonMode ? { response_format: { type: 'json_object' } } : {}) };
-  if (!local) headers.Authorization = `Bearer ${keys[0]}`;
+  body = { model, messages, temperature, max_tokens: maxTokens, stream: Boolean(onChunk), ...(onChunk ? { stream_options: { include_usage: true } } : {}), ...(jsonMode && supportsJsonMode ? { response_format: { type: 'json_object' } } : {}) };
+  headers.Authorization = `Bearer ${keys[0]}`;
   let response: Response | null = null;
   let lastError = '';
   for (const key of keys) {
     const requestHeaders = { ...headers };
-    if (!local) requestHeaders.Authorization = `Bearer ${key}`;
+    requestHeaders.Authorization = `Bearer ${key}`;
     let candidate = await fetcher(endpoint, { method: 'POST', headers: requestHeaders, body: JSON.stringify(body) });
     if (candidate.ok) {
       response = candidate;
@@ -1488,13 +1471,10 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
     } as T;
   }
   if (method === 'models.list') {
-    const local = stringValue(params.provider, 'api') === 'local';
-    if (local) return nativeInvoke<T>('mobile_local_models');
     const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
-    if (!keys.length && !local) throw new Error('请先在设置中填写 API Key。');
-    const endpoint = `${baseURL(params.baseURL, local ? 'local' : 'api')}/models`;
+    if (!keys.length) throw new Error('请先在设置中填写 API Key。');
     const responses = await Promise.allSettled(keys.map(async key => {
-      const response = await fetcher(endpoint, { headers: { ...(local ? {} : { Authorization: `Bearer ${key}` }), Accept: 'application/json' } });
+      const response = await fetcher(`${baseURL(params.baseURL)}/models`, { headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' } });
       if (!response.ok) throw new Error(`模型列表请求失败（${response.status}）`);
       const data = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
       const models = (data.data || data.models || []).map(item => typeof item === 'string' ? item : item.id || '').filter(Boolean);
@@ -1568,8 +1548,6 @@ export const invoke = async <T>(command: string, args?: InvokeArgs): Promise<T> 
   }
   if (!mobileRuntime()) return nativeInvoke<T>(command, args);
   if (command === 'start_agent_runtime') return 'Mobile direct Agent ready' as T;
-  if (command === 'start_local_model') return 'Mobile native MiniCPM5 model ready' as T;
-  if (command === 'stop_local_model') return undefined as T;
   if (command === 'call_agent_rpc') {
     const input = args as { method?: string; params?: MobileParams } | undefined;
     if (!input?.method) throw new Error('缺少 Agent RPC 方法。');

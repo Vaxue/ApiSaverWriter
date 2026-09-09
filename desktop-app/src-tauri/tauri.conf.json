@@ -1,10 +1,10 @@
 {
   "productName": "ApiSaverWriter",
-  "version": "0.1.7",
+  "version": "0.1.6",
   "identifier": "com.apisaverwriter.app",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run prepare:agent-runtime && npm run prepare:local-model && npm run build",
+    "beforeBuildCommand": "npm run prepare:agent-runtime && npm run build",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"
   },
@@ -13,8 +13,7 @@
     "targets": "all",
     "resources": {
       "fanqie_publish.py": "fanqie_publish.py",
-      "runtime/agent-runtime": "agent-runtime",
-      "runtime/local-model": "local-model"
+      "runtime/agent-runtime": "agent-runtime"
     },
     "icon": [
       "icons/32x32.png",

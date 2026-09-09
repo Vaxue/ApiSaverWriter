@@ -8,30 +8,7 @@ Android 与 iOS 不启动桌面 Node 子进程，直接通过 Tauri 原生 HTTP 
 
 如果接口没有浏览器 CORS 头，应用会自动使用内置的 `tauri-plugin-http` 原生请求通道；桌面端仍使用内置 Agent Runtime。
 
-## 移动端本地模型
-
-iOS/Android 现在支持将 `MiniCPM5-2B-Q4_K_M.gguf` 直接作为 Tauri mobile 资源打包，并通过 Rust 原生 `llama-cpp-4` 在设备内部推理：
-
-- iOS：llama.cpp Metal 原生后端（减少 CPU 内存压力）
-- Android：llama.cpp CPU/NEON 基线后端
-- 移动端本地推理硬限制为 2048 context / 1024 output tokens，避免 iOS 内存压力导致系统直接杀进程
-- 手机不需要局域网电脑、不需要 API Key、不启动 `llama-server`
-- 本地模型请求通过 Tauri command 进入原生推理，不经过 HTTP
-
-移动端资源构建需要提前提供模型文件：
-
-```bash
-export APISAVERWRITER_BUNDLE_LOCAL_MODEL=1
-export APISAVERWRITER_LOCAL_MODEL=/absolute/path/MiniCPM5-2B-Q4_K_M.gguf
-npm run android:build --prefix desktop-app
-# 或
-npm run ios:build --prefix desktop-app
-```
-
-注意：1.56GB GGUF 会显著增大 APK/IPA，Android 发布包更适合使用 Play Asset Pack；iOS 需要在真实设备上验证 App 内存限制。当前移动端原生实现按请求加载模型并返回完整结果，章节正文流式体验会在原生推理稳定后再改为 token event 流。
-
-如果不把模型打进移动包，仍可以切换到 API 付费模式；桌面端继续使用 `llama-server` 资源方案。
-
+## 初始化与构建
 
 Android 需要 Android SDK、NDK、JDK，并设置 `ANDROID_HOME`（或 `ANDROID_SDK_ROOT`）。
 

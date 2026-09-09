@@ -1,6 +1,6 @@
 [package]
 name = "apisaverwriter"
-version = "0.1.7"
+version = "0.1.6"
 description = "AI Novel Writing Assistant - 用最少的API写出最火的小说"
 authors = ["you"]
 license = "AGPL-3.0-or-later"
@@ -22,23 +22,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 flate2 = "1"
 
-[target.'cfg(target_os = "ios")'.dependencies]
-# iOS uses llama.cpp Metal so model layers stay off the CPU heap. The local
-# vendor patch keeps iPhoneOS framework linking separate from macOS runtime
-# linking.
-llama-cpp-4 = { version = "0.5.0", default-features = false, features = ["metal"] }
-
-[target.'cfg(target_os = "android")'.dependencies]
-# CPU NEON is the conservative Android baseline; Vulkan can be enabled in a
-# later ABI-specific build once device coverage is verified.
-llama-cpp-4 = { version = "0.5.0", default-features = false }
-
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
-
-# The published llama-cpp-sys-4 0.5.1 adds clang_rt.osx even for iOS,
-# which makes Xcode reject the final arm64 iPhoneOS link. This local patch
-# keeps iOS framework links but omits the macOS/Catalyst runtime archive.
-[patch.crates-io]
-llama-cpp-sys-4 = { path = "../../vendor/llama-cpp-sys-4" }

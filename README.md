@@ -4,17 +4,11 @@
 
 > ApiSaverWriter 是一款面向长篇网文创作的 AI 写作软件、AI 写小说软件和本地优先写作工作台。
 
-[![Version](https://img.shields.io/badge/version-0.1.7-1677ff)](https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa)
+[![Version](https://img.shields.io/badge/version-0.1.6-1677ff)](https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-20a162)](#下载安装)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-8a2be2)](LICENSE)
 
 ApiSaverWriter 将作品资料、世界观、大纲、章节、角色卡、记忆与写作技能组织在一个本地项目中。它面向需要持续创作、追踪设定与维持上下文一致性的长篇网文作者，而不是一次性文本生成器。
-
-## 本地免费与 API 模式
-
-项目默认支持本地免费模式：使用 `MiniCPM5-2B` 的 GGUF 4bit 量化模型，通过 `llama.cpp` 或 Ollama 的 OpenAI 兼容接口运行，不需要 API Key。需要更高质量模型或云端算力时，可以在设置中切换到 ApiSaver API 付费模式。
-
-详细部署步骤见 [LOCAL_MODEL.md](LOCAL_MODEL.md)。本地模型权重、推理二进制和 API Key 不提交到仓库。
 
 ## 下载安装
 
@@ -80,7 +74,7 @@ ApiSaverWriter 将作品资料、世界观、大纲、章节、角色卡、记�
 
 ## 界面预览
 
-以下截图来自 v0.1.7 的实际构建，用于展示主要工作流；移动端采用独立的窄屏布局。
+以下截图来自 v0.1.6 的实际构建，用于展示主要工作流；移动端采用独立的窄屏布局。
 
 | 首页 | 新建小说 |
 | --- | --- |

@@ -245,7 +245,6 @@ export type ChapterStateType = typeof ChapterState.State;
 
 interface ChapterGraphConfig {
   store: StoryStore;
-  provider?: "api" | "local";
   apiKey: string;
   apiKeys?: string[];
   baseURL?: string;
@@ -263,7 +262,6 @@ interface ChapterGraphConfig {
 export function createChapterGraph(config: ChapterGraphConfig) {
   const store = config.store;
   const client = new ApiSaverClient({
-    provider: config.provider,
     apiKey: config.apiKey,
     apiKeys: config.apiKeys,
     baseURL: config.baseURL,
