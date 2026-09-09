@@ -45,14 +45,14 @@ buildSync({
   platform: 'node',
   format: 'cjs',
   target: 'node22',
-  external: ['better-sqlite3', 'undici', 'iconv-lite'],
+  external: ['better-sqlite3', 'undici', 'iconv-lite', '@xenova/transformers', 'onnxruntime-node', 'onnxruntime-web', 'sharp'],
   outfile: join(runtimeRoot, 'main.cjs'),
   logLevel: 'info',
 });
 
 // better-sqlite3 is a native module. Keep it external to the single-file JS
 // bundle and carry its matching prebuilt binary alongside the bundled runtime.
-for (const dependency of ['better-sqlite3', 'bindings', 'file-uri-to-path', 'undici', 'iconv-lite', 'safer-buffer']) copyPackage(dependency);
+for (const dependency of ['better-sqlite3', 'bindings', 'file-uri-to-path', 'undici', 'iconv-lite', 'safer-buffer', '@xenova/transformers', '@huggingface/jinja', 'onnxruntime-web', 'onnxruntime-node', 'sharp']) copyPackage(dependency);
 
 const packagedNode = join(runtimeRoot, process.platform === 'win32' ? 'node.exe' : 'node');
 if (!existsSync(nodeBinary)) throw new Error(`找不到用于打包的 Node.js：${nodeBinary}`);
