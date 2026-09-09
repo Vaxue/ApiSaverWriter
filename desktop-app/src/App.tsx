@@ -604,6 +604,23 @@ interface GatewayUsageSnapshot {
   accounts: GatewayUsageAccount[];
   errors: string[];
 }
+/** 中转站调用日志行：字段来自后端透传的账单 log，均为可选。 */
+interface GatewayLogRow extends Record<string, unknown> {
+  id?: string | number;
+  created_at?: number | string;
+  token_name?: string;
+  model_name?: string;
+  is_stream?: boolean;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  quota?: number;
+  use_time?: number;
+  other?: string;
+  content?: string;
+  group?: string;
+  __keyHint?: string;
+  __keyIndex?: number;
+}
 interface GatewayPricingEntry extends Record<string, unknown> {
   __account: GatewayUsageAccount;
   __group?: string;
@@ -655,6 +672,8 @@ interface AgentConfig {
   // Keep the relationship so calls never default to an unrelated first key.
   modelKeyMap: Record<string, string[]>;
   model: string;
+  /** 廉价路由小模型（意图识别/技能路由专用）；留空时与主模型共用。 */
+  routerModel: string;
   contextWindow: number;
   reasoningMode: ReasoningMode;
   proxyEnabled: boolean;
@@ -662,6 +681,8 @@ interface AgentConfig {
   proxyBypassLocal: boolean;
   /** Number of chapters before the immediate predecessor to merge into one summary. */
   memorySummaryChapterCount: number;
+  /** 检索记忆预算（汉字数），控制每次写作注入的结构化记忆总量。 */
+  memoryBudgetChars: number;
 }
 
 const agentStageLabel: Record<AgentStage, string> = {
@@ -785,12 +806,14 @@ const normalizeAgentConfig = (value: unknown): AgentConfig => {
     imageModel: typeof parsed.imageModel === 'string' && parsed.imageModel.trim() ? parsed.imageModel.trim() : 'gpt-image-2',
     modelKeyMap,
     model: typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : fallbackModels[0],
+    routerModel: typeof parsed.routerModel === 'string' && parsed.routerModel.trim() ? parsed.routerModel.trim() : '',
     contextWindow: Number((parsed as Record<string, unknown>).contextWindowKB ?? (Number(parsed.contextWindow) > 1024 ? Number(parsed.contextWindow) / 1024 : parsed.contextWindow)) || 128,
     reasoningMode: parsed.reasoningMode === 'off' || parsed.reasoningMode === 'low' || parsed.reasoningMode === 'medium' || parsed.reasoningMode === 'high' || parsed.reasoningMode === 'max' || parsed.reasoningMode === 'custom' ? parsed.reasoningMode : 'auto',
     proxyEnabled: parsed.proxyEnabled === true,
     proxyURL: typeof parsed.proxyURL === 'string' && parsed.proxyURL.trim() ? parsed.proxyURL : 'http://127.0.0.1:7897',
     proxyBypassLocal: parsed.proxyBypassLocal === true,
     memorySummaryChapterCount: Math.max(0, Math.min(20, Number(parsed.memorySummaryChapterCount) || 5)),
+    memoryBudgetChars: Math.max(2000, Math.min(30000, Number(parsed.memoryBudgetChars) || 10000)),
   };
 };
 const agentNetworkParams = (config: AgentConfig) => ({
@@ -984,36 +1007,6 @@ const readableChapterPlan = (value?: string): string => {
   } catch { /* Plain Markdown plans are already suitable for display. */ }
   return text;
 };
-
-const snapshotMarkdown = (memory: ChapterMemory) => `# ${memory.chapterTitle} 记忆快照
-
-## 章节摘要
-${memory.summary || '暂无摘要'}
-
-## 关键词
-${memory.keywords.length ? memory.keywords.map(item => `- ${item}`).join('\n') : '- 暂无'}
-
-## 人物状态变化
-${memoryListMarkdown(memory.characterStateChanges)}
-
-## 角色认知变化
-${memoryListMarkdown(memory.knowledgeChanges)}
-
-## 伏笔变化
-${memoryListMarkdown(memory.foreshadowingChanges)}
-
-## 时间线事件
-${memoryListMarkdown(memory.timelineEvents)}
-
-## 设定事实
-${memoryListMarkdown(memory.canonFacts)}
-
-## 冲突
-${memoryListMarkdown(memory.conflicts)}
-
-## 章末钩子
-${memory.endingHook || '暂无'}
-`;
 
 const buildMemoryDocuments = (memories: ChapterMemory[], existingDocuments: MemoryDocument[] = [], force = false): MemoryDocument[] => {
   const ordered = [...memories].sort((left, right) => chapterOrder(left) - chapterOrder(right));
@@ -1509,14 +1502,13 @@ function App() {
   const [activeLibraryChapterId, setActiveLibraryChapterId] = useState<string | null>(null);
   const [libraryChapterDownloadRunningId, setLibraryChapterDownloadRunningId] = useState<string | null>(null);
   const [libraryOutlineRunningId, setLibraryOutlineRunningId] = useState<string | null>(null);
-  const [activeRankingBookId, setActiveRankingBookId] = useState<string | null>(null);
+  const [, setActiveRankingBookId] = useState<string | null>(null);
   const [rankingPlatform, setRankingPlatform] = useState<RankingPlatform>('fanqie');
   const [rankingType, setRankingType] = useState<RankingType>('read');
   const [fanqieSection, setFanqieSection] = useState<FanqieSection>('male-read');
   const [fanqieCategories, setFanqieCategories] = useState<Record<FanqieSection, RankingCategoryOption[]>>({ 'male-read': [], 'male-new': [], 'female-read': [], 'female-new': [] });
   const [fanqieCategoryId, setFanqieCategoryId] = useState('all');
   const [fanqieCategoriesLoading, setFanqieCategoriesLoading] = useState(false);
-  const [rankingGender, setRankingGender] = useState<'male' | 'female' | 'all'>('all');
   const [rankingLoading, setRankingLoading] = useState(false);
   const [rankingQuery, setRankingQuery] = useState('');
   const [rankingFontCss, setRankingFontCss] = useState('');
@@ -1539,7 +1531,7 @@ function App() {
   const [skills, setSkills] = useState<Skill[]>(() => builtinSkills);
   const [skillCategoryFilter, setSkillCategoryFilter] = useState('');
   const [skillSearch, setSkillSearch] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [, setLoading] = useState(false);
   const [deviceStorageReady, setDeviceStorageReady] = useState(false);
   const [resourceStorageReady, setResourceStorageReady] = useState(false);
   
@@ -1593,7 +1585,7 @@ function App() {
   const [expandedGraphDocumentIds, setExpandedGraphDocumentIds] = useState<string[]>([]);
   const [selectedCardIds, setSelectedCardIds] = useState<number[]>([]);
   const [selectedOutlineCardIds, setSelectedOutlineCardIds] = useState<number[]>([]);
-  const [selectedMemoryIds, setSelectedMemoryIds] = useState<number[]>([]);
+  const [, setSelectedMemoryIds] = useState<number[]>([]);
   const [selectedOutlineIds, setSelectedOutlineIds] = useState<number[]>([]);
   const [selectedAgentSkillNames, setSelectedAgentSkillNames] = useState<string[]>([]);
   const [showAgentSkillPicker, setShowAgentSkillPicker] = useState(false);
@@ -1638,6 +1630,7 @@ function App() {
   const [agentStage, setAgentStage] = useState<AgentStage>('idle');
   const [agentDraft, setAgentDraft] = useState<AgentDraftResult | null>(null);
   const [agentDisplayContent, setAgentDisplayContent] = useState('');
+  const agentStreamLiveRef = useRef<HTMLDivElement | null>(null);
   const [outlineChatMessages, setOutlineChatMessages] = useState<AgentChatMessage[]>([]);
   const [cardChatMessages, setCardChatMessages] = useState<AgentChatMessage[]>([]);
   const [chapterSessionId, setChapterSessionId] = useState(() => `chapter-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
@@ -1764,7 +1757,7 @@ function App() {
   const [bannedWords, setBannedWords] = useState<string[]>(() => {
     try {
       const parsed = JSON.parse(localStorage.getItem('writer-banned-words') || '[]');
-      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string' && item.trim()).map(item => item.trim()) : [];
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).map(item => item.trim()) : [];
     } catch { return []; }
   });
   const [bannedWordsDraft, setBannedWordsDraft] = useState('');
@@ -1855,7 +1848,7 @@ function App() {
           const source = data.context?.source;
           setOutlineAgentActivity(current => {
             const id = `${step}:${message}`;
-            const status = payload.type === 'error' ? 'error' : payload.type === 'complete' ? 'complete' : 'active';
+            const status: 'active' | 'complete' | 'error' = payload.type === 'error' ? 'error' : payload.type === 'complete' ? 'complete' : 'active';
             const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
             const existing = previous.findIndex(item => item.id === id);
             if (existing >= 0) return previous.map((item, index) => index === existing ? { ...item, status, source: source || item.source } : item).slice(-12);
@@ -1960,7 +1953,7 @@ function App() {
           const source = data.context?.source;
           setOutlineAgentActivity(current => {
             const id = `${step}:${message}`;
-            const status = payload.type === 'error' ? 'error' : payload.type === 'complete' ? 'complete' : 'active';
+            const status: 'active' | 'complete' | 'error' = payload.type === 'error' ? 'error' : payload.type === 'complete' ? 'complete' : 'active';
             const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
             const existing = previous.findIndex(item => item.id === id);
             return (existing >= 0 ? previous.map((item, index) => index === existing ? { ...item, status, source: source || item.source } : item) : [...previous, { id, step, message, status, source }]).slice(-12);
@@ -2006,6 +1999,13 @@ function App() {
     window.addEventListener('agent-progress', receive);
     return () => window.removeEventListener('agent-progress', receive);
   }, []);
+
+  useEffect(() => {
+    // 流式进行中跟随最新输出滚动到底部，结束后不再干预
+    if (agentDraft?.draftContent) return;
+    const live = agentStreamLiveRef.current;
+    if (live) live.scrollTop = live.scrollHeight;
+  }, [agentDisplayContent, agentDraft]);
 
   useEffect(() => {
     if (!('__TAURI_INTERNALS__' in window)) return;
@@ -2627,7 +2627,7 @@ function App() {
       const result = await invoke<{ chapters?: Partial<LibraryBookChapter>[]; intro?: string; cover?: string; downloadedChapterCount?: number; completedChapterCount?: number }>('call_agent_rpc', {
         method: 'book.download',
         params: {
-          title: downloadable.title, author: downloadable.author, source: downloadable.sourceId || 'fanqie', sourceBookId: downloadable.sourceBookId || downloadable.id, url: downloadable.url,
+          title: downloadable.title, author: downloadable.author, source: ('sourceId' in downloadable && downloadable.sourceId) || 'fanqie', sourceBookId: downloadable.sourceBookId || downloadable.id, url: downloadable.url,
           // 不设置人为上限，按书源完整目录下载全部章节。
           ...agentNetworkParams(agentConfig),
         },
@@ -2635,7 +2635,7 @@ function App() {
       const downloadedChapterCount = Number(result.completedChapterCount) || (result.chapters || []).filter(chapter => chapter.downloaded === true && typeof chapter.content === 'string' && chapter.content.trim()).length;
       if (!downloadedChapterCount) throw new Error('没有获取到完整正文，未保存空章节。可稍后重试，或导入本地 TXT。');
       const now = new Date().toISOString();
-      const normalized = normalizeLibraryBook({ ...downloadable, id: libraryBooks.find(item => item.sourceBookId === (downloadable.sourceBookId || downloadable.id))?.id || localResourceId('book'), chapters: result.chapters || [], intro: result.intro || downloadable.intro, cover: result.cover || downloadable.cover, downloadedAt: now, createdAt: now, updatedAt: now });
+      const normalized = normalizeLibraryBook({ ...downloadable, id: libraryBooks.find(item => item.sourceBookId === (downloadable.sourceBookId || downloadable.id))?.id || localResourceId('book'), chapters: (result.chapters || []).map((chapter, index) => normalizeLibraryBookChapter(chapter, index)), intro: result.intro || downloadable.intro, cover: result.cover || downloadable.cover, downloadedAt: now, createdAt: now, updatedAt: now });
       setLibraryBooks(current => {
         const existing = current.findIndex(item => item.sourceBookId === (downloadable.sourceBookId || downloadable.id) || item.id === normalized.id);
         if (existing >= 0) return current.map((item, index) => index === existing ? { ...item, ...normalized, id: item.id } : item);
@@ -2912,6 +2912,11 @@ function App() {
     }
     if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
       setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再生成原创改写稿。' });
+      return;
+    }
+    const target = book.boundProjectId ? projects.find(project => project.id === book.boundProjectId) : undefined;
+    if (!target) {
+      setNotice({ title: '请先绑定小说', content: '在拆书详情顶部选择目标小说后，才能生成原创改写稿。' });
       return;
     }
     setDismantleRewriteRunning(true);
@@ -4064,7 +4069,11 @@ function App() {
         const label = selectedCardIds.includes(card.id) ? '本章引用' : '正文提及';
         graphEdges.push({ id, source: chapterNodeId, target: `card:${card.id}`, label, weight: defaultKnowledgeGraphWeight(label), sourceChapterId: chapter.id, updatedAt: new Date().toISOString() });
       });
-      [project.protagonist1, project.protagonist2].filter((name): name is string => Boolean(name?.trim()) && chapter.content.includes(name.trim())).forEach(name => {
+      [project.protagonist1, project.protagonist2].filter((name): name is string => {
+        const trimmed = name?.trim();
+        if (!trimmed) return false;
+        return chapter.content.includes(trimmed);
+      }).forEach(name => {
         const target = `entity:${name.trim()}`;
         graphEdges.push({ id: `${chapterNodeId}->${target}`, source: chapterNodeId, target, label: '章节主角', weight: 0.92, sourceChapterId: chapter.id, updatedAt: new Date().toISOString() });
       });
@@ -4698,7 +4707,7 @@ function App() {
       setNotice({ title: '大纲已生成', content: `${targetOutline.title} 已依据${sourceChapter ? `第 ${chapterNumberFromText(sourceChapter.title) || editingProject.chapters.findIndex(chapter => chapter.id === sourceChapter.id) + 1} 章正文` : '作品资料'}生成。` });
     } catch (error) {
       setAgentError(String(error));
-      setOutlineAgentActivity(current => [...current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item), { id: `error-${Date.now()}`, step: 'error', message: String(error), status: 'error' }].slice(-12));
+      setOutlineAgentActivity(current => [...current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item), { id: `error-${Date.now()}`, step: 'error', message: String(error), status: 'error' as const }].slice(-12));
       setNotice({ title: '大纲生成失败', content: String(error) });
     } finally {
       setOutlineGenerating(false);
@@ -4727,8 +4736,9 @@ function App() {
           status: 'pending' as const,
         }));
       }
-      const resumeEnd = options.resumeFromChapter + count - 1;
-      return current.map(item => item.chapterNumber >= options.resumeFromChapter && item.chapterNumber <= resumeEnd
+      const resumeStart = options.resumeFromChapter;
+      const resumeEnd = resumeStart + count - 1;
+      return current.map(item => item.chapterNumber >= resumeStart && item.chapterNumber <= resumeEnd
         ? { ...item, title: item.title || `第 ${item.chapterNumber} 章`, status: 'pending' as const, outline: undefined, content: undefined, memory: undefined }
         : item);
     });
@@ -4794,7 +4804,8 @@ function App() {
             memoryDocuments: [], writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
             skills: skillPayload, preferredSkillNames: [], authorPreferences: working.authorPreferences || [],
             apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
-            model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow,
+            model: agentConfig.model.trim() || fallbackModels[0], routerModel: agentConfig.routerModel.trim() || undefined, apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow,
+            memoryBudgetChars: agentConfig.memoryBudgetChars,
             ...agentNetworkParams(agentConfig),
           },
         });
@@ -4929,7 +4940,7 @@ function App() {
       setCardDraft(current => ({
         ...current,
         title: result.title?.trim() || current.title || `${current.type}设定`,
-        content: result.content.trim(),
+        content: result.content?.trim() || '',
       }));
       setCardChatMessages(current => [...current, { role: 'assistant', content: result.content?.trim() || '', createdAt: new Date().toISOString() }]);
       setNotice({ title: '卡片草稿已生成', content: '内容已填入左侧编辑器，请检查后点击“保存卡片”。' });
@@ -5318,7 +5329,7 @@ function App() {
           cards: editingProject.cards.filter(card => resolvedCardIds.includes(card.id)).sort((left, right) => left.id - right.id).slice(0, 10),
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
           skills: [...agentSkills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])]
-            .map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
+            .map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : skill.name, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
           preferredSkillNames: prioritizedSkillNames,
           // 章节承接只传入紧邻上一章正文；更早章节合并成一个稳定摘要，避免正文膨胀。
           previousChapters: continuityChapter ? [{ id: continuityChapter.id, title: continuityChapter.title, content: continuityChapter.content }] : [],
@@ -5340,6 +5351,8 @@ function App() {
           apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || 'gpt-4o-mini',
+          routerModel: agentConfig.routerModel.trim() || undefined,
+          memoryBudgetChars: agentConfig.memoryBudgetChars,
           apiMode: agentConfig.apiMode,
           reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow,
@@ -5878,6 +5891,8 @@ function App() {
       imageApiKey: settingsDraft.imageApiKey.trim(),
       imageModel: settingsDraft.imageModel.trim() || 'gpt-image-2',
       model: selectedModel,
+      routerModel: settingsDraft.routerModel.trim(),
+      memoryBudgetChars: Math.max(2000, Math.min(30000, Number(settingsDraft.memoryBudgetChars) || 10000)),
       contextWindow: Math.max(16, Number(settingsDraft.contextWindow) || 128),
     }, selectedModel));
     setAgentError('');
@@ -6020,7 +6035,7 @@ function App() {
     ]
     : []);
   const graphDocumentGroups = editingProject ? Array.from(new Set(editingProject.graphNodes.map(graphNodeGroup))) : [];
-  const activeGraphDocumentGroup = graphDocumentGroups.includes(graphDocumentGroup) ? graphDocumentGroup : (graphDocumentGroups[0] || '');
+  const activeGraphDocumentGroup = (graphDocumentGroups as string[]).includes(graphDocumentGroup) ? graphDocumentGroup : (graphDocumentGroups[0] || '');
   const graphDocumentTypeOptions = editingProject ? Array.from(new Set(editingProject.graphNodes.map(graphNodeTypeLabel))).sort((left, right) => left.localeCompare(right, 'zh-CN')) : [];
   const graphDocumentNodes = editingProject ? editingProject.graphNodes.filter(node => {
     const matchesGroup = !activeGraphDocumentGroup || graphNodeGroup(node) === activeGraphDocumentGroup;
@@ -6173,7 +6188,7 @@ function App() {
     const value = Number(log.created_at || 0);
     return value > 10_000_000_000 ? value : value * 1000;
   };
-  const gatewayLogs = (gatewayUsage?.accounts || []).flatMap(account => account.logs.map(log => ({ ...log, __keyHint: account.keyHint, __keyIndex: account.keyIndex }))).filter(log => {
+  const gatewayLogs = (gatewayUsage?.accounts || []).flatMap(account => account.logs.map(log => ({ ...log, __keyHint: account.keyHint, __keyIndex: account.keyIndex } as GatewayLogRow))).filter(log => {
     const timestamp = gatewayLogTime(log);
     if (!timestamp) return true;
     const date = new Date(timestamp);
@@ -6982,6 +6997,21 @@ function App() {
 
                 {agentError && <div className="agent-error">{agentError}</div>}
 
+                {!agentDraft?.draftContent && agentDisplayContent && (
+                  <section className="agent-stream-panel" aria-live="polite">
+                    <div className="agent-stream-head">
+                      <span className="agent-stream-pulse" aria-hidden="true" />
+                      <strong>正在书写</strong>
+                      <small>模型实时输出 · 打字机预览</small>
+                      <span className="agent-stream-count">{countNovelCharacters(agentDisplayContent).toLocaleString()} 字</span>
+                    </div>
+                    <div className="agent-stream-live" ref={agentStreamLiveRef}>
+                      {agentDisplayContent}
+                      <span className="agent-stream-caret" aria-hidden="true" />
+                    </div>
+                  </section>
+                )}
+
                 {agentDraft?.draftContent && (
                   <section className="agent-result-section">
                     <div className="agent-result-title"><strong>章节草稿</strong><span>{countNovelCharacters(agentDraft.draftContent)} 字</span></div>
@@ -7297,6 +7327,10 @@ function App() {
                     </div>
                     {modelListMessage && <p className={`model-list-message ${modelListMessage.includes('失败') || modelListMessage.includes('错误') ? 'error' : ''}`}>{modelListMessage}</p>}
                   </div>
+                  <div className="form-group">
+                    <label>路由小模型 <small>可选 · 意图识别/技能路由专用，留空时使用当前模型</small></label>
+                    <input className="input" value={settingsDraft.routerModel} placeholder="如 gpt-4o-mini，选廉价模型节省路由开销" onChange={(event) => setSettingsDraft({ ...settingsDraft, routerModel: event.target.value })} />
+                  </div>
                   <div className="settings-grid-two">
                     <div className="form-group"><label>上下文窗口 <strong>{Number(settingsDraft.contextWindow).toLocaleString()} KB</strong></label><input className="settings-range" type="range" min="16" max="512" step="16" value={settingsDraft.contextWindow} onChange={(event) => setSettingsDraft({ ...settingsDraft, contextWindow: Number(event.target.value) })} /></div>
                     <div className="form-group"><label>推理模式</label><select className="select" value={settingsDraft.reasoningMode} onChange={(event) => setSettingsDraft({ ...settingsDraft, reasoningMode: event.target.value as ReasoningMode })}><option value="auto">自动</option><option value="off">关闭</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最大</option><option value="custom">自定义</option></select></div>
@@ -7310,6 +7344,11 @@ function App() {
                   <label>前章记忆摘要数量 <strong>{settingsDraft.memorySummaryChapterCount} 章</strong></label>
                   <input className="settings-range" type="range" min="0" max="20" step="1" value={settingsDraft.memorySummaryChapterCount} onChange={event => setSettingsDraft({ ...settingsDraft, memorySummaryChapterCount: Number(event.target.value) })} />
                   <small className="settings-network-note">读取上一章之前的最近 N 章结构化记忆并合并为一个稳定摘要。设为 0 表示关闭；不会加载更早章节正文。</small>
+                </div>
+                <div className="form-group">
+                  <label>检索记忆预算 <strong>{settingsDraft.memoryBudgetChars.toLocaleString()} 字</strong></label>
+                  <input className="settings-range" type="range" min="2000" max="30000" step="1000" value={settingsDraft.memoryBudgetChars} onChange={event => setSettingsDraft({ ...settingsDraft, memoryBudgetChars: Number(event.target.value) })} />
+                  <small className="settings-network-note">每次写作注入的结构化记忆总量上限（人物状态、伏笔、时间线等）。预算越大记忆越完整，但消耗上下文越多；默认 1 万字。</small>
                 </div>
                 <div className="settings-context-preview"><span>固定上下文顺序</span><strong>世界观与作品设定 → 文风与技能 → 上一章正文/记忆 → 前章摘要 → 当前章纲与指令</strong></div>
               </section>}

@@ -172,7 +172,7 @@ function splitSessionContext(value?: string): { summary: string; recent: string 
   return { summary: context.slice(0, index).trim(), recent: context.slice(index).trim() };
 }
 
-export function selectSkillsByIntent(instruction: string, catalog: SkillDefinition[]): { intent: string; skills: SkillDefinition[] } {
+export function selectSkillsByIntent(instruction: string, catalog: SkillDefinition[]): { intent: string; skills: SkillDefinition[]; confident: boolean; topScore: number } {
   const query = instruction.toLowerCase();
   const scored = catalog.map(skill => {
     const terms = [skill.name, skill.displayName || "", skill.category || "", skill.description || "", ...(skill.tags || [])]
@@ -195,7 +195,87 @@ export function selectSkillsByIntent(instruction: string, catalog: SkillDefiniti
   const fallback = catalog.find(skill => skill.name === "story-long-write") || catalog.find(skill => skill.category === "write");
   const skills = selected.length ? selected : (fallback ? [fallback] : []);
   const category = skills[0]?.category || "write";
-  return { intent: intentLabels[category] || "章节创作与续写", skills };
+  // 第一层（规则）只在出现"得分唯一的领先者"时拍板；并列领先或零命中都交给
+  // 第二层——模糊指令的意图往往取决于会话上下文（指代、延续），词面打分无法裁决。
+  const leaderScore = scored[0]?.score || 0;
+  const runnerUpScore = scored[1]?.score || 0;
+  const confident = leaderScore >= 3 && leaderScore > runnerUpScore;
+  return { intent: intentLabels[category] || "章节创作与续写", skills, confident, topScore: leaderScore };
+}
+
+// 第二层：小模型分类。只做廉价的高频语义归类，输入只带技能元数据（name/描述/
+// 标签），不带技能正文——路由要的是语境（会话摘要与最近轮次中的指代消解、意图
+// 延续），不是方法论全文。
+const skillRouterSystemPrompt = `你是长篇小说写作 Agent 的技能路由器。根据作者当前指令和会话上下文，从候选技能中选出本次真正需要遵循的技能。
+优先结合会话摘要消解指代（如“那个伏笔”“还是那个风格”）并延续上一轮意图；与本次任务无关的技能不要选。
+只返回严格 JSON 对象，不要代码围栏或解释：{"skills":["技能name"],"confidence":0到1的小数}。confidence 低于 0.6 表示不确定，此时 skills 返回空数组。`;
+
+// 第三层：主模型长尾路由。只有小模型低置信（或未配置）才触发——处理比喻、
+// 复合意图等真正的长尾语义，允许更深入的判断。
+const skillLongTailRouterPrompt = `你是长篇小说写作 Agent 的资深技能调度主编。作者的指令可能有比喻、隐含目标或复合意图（例如“把第三章捋顺一点”可能同时涉及润色与审查）。
+请结合会话摘要、最近轮次与候选技能的描述，判断本次创作真正需要遵循的技能集合；拿不准的技能不要选。
+只返回严格 JSON 对象，不要代码围栏或解释：{"skills":["技能name"],"confidence":0到1的小数}。confidence 低于 0.6 表示无法判断，此时 skills 返回空数组。`;
+
+export interface SkillRouteResult {
+  skills: SkillDefinition[];
+  confidence: number;
+  usage?: ApiUsage;
+}
+
+export async function routeSkillsWithModel(
+  instruction: string,
+  catalog: SkillDefinition[],
+  sessionContext: string | undefined,
+  chat: ApiSaverClient["chat"],
+  tier: "fast" | "strong" = "fast",
+): Promise<SkillRouteResult | undefined> {
+  if (!catalog.length) return undefined;
+  const session = splitSessionContext(sessionContext);
+  const candidates = catalog.map(skill => ({
+    name: skill.name,
+    displayName: skill.displayName || skill.name,
+    category: skill.category || "",
+    description: compactText(skill.description || "", 160),
+    tags: (skill.tags || []).slice(0, 6),
+  }));
+  const material = [
+    session.summary ? `## 会话摘要\n${session.summary}` : "",
+    session.recent ? `## 最近会话轮次\n${session.recent}` : "",
+    `## 候选技能\n${JSON.stringify(candidates)}`,
+  ].filter(Boolean).join("\n\n");
+  const systemPrompt = tier === "strong" ? skillLongTailRouterPrompt : skillRouterSystemPrompt;
+  try {
+    const response = await chat([
+      { role: "system", content: systemPrompt },
+      { role: "user", content: `## 作者当前指令\n${compactText(instruction, 1200)}\n\n${material}\n\n请返回 JSON：{"skills":["name"],"confidence":0-1}` },
+    ], { response_format: { type: "json_object" }, temperature: 0, max_tokens: tier === "strong" ? 400 : 200, retryAttempts: 1 });
+    const parsed = JSON.parse(response.content) as { skills?: unknown; confidence?: unknown };
+    const names = Array.isArray(parsed.skills)
+      ? parsed.skills.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean)
+      : [];
+    const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
+    // 置信度门槛在代码里强制执行，而不是依赖模型自觉遵守提示词契约。
+    if (confidence < 0.6) return { skills: [], confidence, usage: response.usage };
+    const matched = names
+      .map(name => catalog.find(skill => skill.name === name || skill.displayName === name)
+        || catalog.find(skill => skill.name.toLowerCase() === name.toLowerCase()))
+      .filter((skill): skill is SkillDefinition => Boolean(skill));
+    const unique = [...new Map(matched.map(skill => [skill.name, skill])).values()];
+    return { skills: unique, confidence, usage: response.usage };
+  } catch {
+    // 路由失败必须无害：返回 undefined 让调用方走第三层广谱兜底。
+    return undefined;
+  }
+}
+
+// 第三层：路由失败或低置信时放弃猜测，广谱注入——写作类技能排前排，主模型
+// 在候选中自行遵循。路由层永远不能成为正确性的前置条件，错了也只是多花 token。
+function broadSkillFallback(catalog: SkillDefinition[]): SkillDefinition[] {
+  return [
+    ...catalog.filter(skill => skill.category === "write"),
+    ...catalog.filter(skill => skill.category && skill.category !== "write"),
+    ...catalog.filter(skill => !skill.category),
+  ].slice(0, 6);
 }
 
 export const ChapterState = Annotation.Root({
@@ -214,7 +294,7 @@ export const ChapterState = Annotation.Root({
   selectedSkills: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
   recognizedIntent: Annotation<string | undefined>,
   retrievedContext: Annotation<string[]>({
-    reducer: (prev, next) => next,
+    reducer: (_prev, next) => next,
     default: () => [],
   }),
   continuityContext: Annotation<string | undefined>,
@@ -249,9 +329,19 @@ interface ChapterGraphConfig {
   apiKeys?: string[];
   baseURL?: string;
   model?: string;
+  /** 第二层路由使用的廉价小模型；未配置时长尾语义直接由主模型路由。 */
+  routerModel?: string;
+  /** 路由小模型的独立端点（如本地 Ollama/LM Studio）；未配置时与主模型共用 baseURL。 */
+  routerBaseURL?: string;
+  /** 路由小模型的密钥；本地模型通常无需鉴权，可与主模型不同。 */
+  routerApiKey?: string;
+  /** 路由小模型的 API 协议；未配置时沿用主模型协议。 */
+  routerApiMode?: "openai" | "responses" | "anthropic";
   apiMode?: "openai" | "responses" | "anthropic";
   reasoningMode?: string;
   contextWindowKB?: number;
+  /** 检索记忆预算（汉字数）；默认 1 万字，UTF-8 中文约 3 字节/字。 */
+  memoryBudgetChars?: number;
   proxyEnabled?: boolean;
   proxyURL?: string;
   proxyBypassLocal?: boolean;
@@ -274,6 +364,30 @@ export function createChapterGraph(config: ChapterGraphConfig) {
     proxyBypassLocal: config.proxyBypassLocal,
   });
   const emitter = config.streamEmitter;
+  // 检索记忆字节预算：按汉字数换算（UTF-8 中文约 3 字节/字），下限保底 4600 字节
+  // 防止配置过小导致检索层失效；单条上限随总预算缩放（约 1/6），预算大时单条记忆也能带全文。
+  const memoryBudgetBytes = Math.max(4600, Math.floor((config.memoryBudgetChars || 10000) * 3));
+  const memoryPerItemCap = Math.max(760, Math.floor(memoryBudgetBytes / 6));
+  // plan/draft 资料段上限随记忆预算等比缩放（默认 1 万字时缩放系数为 1），
+  // 预算加大时各资料段同步放宽，避免"检索带回了更多记忆，计划阶段却用不上"。
+  const planMaterialScale = memoryBudgetBytes / 30000;
+  const scaleCap = (base: number) => Math.max(300, Math.round(base * planMaterialScale));
+  // 第二层路由客户端：默认与主模型共享凭证/协议/端点，仅指向廉价小模型；
+  // 配置 routerBaseURL 时可直连本地模型（Ollama/LM Studio 等），与主模型网关解耦。
+  const routerClient = config.routerModel
+    ? new ApiSaverClient({
+      apiKey: config.routerApiKey ?? config.apiKey,
+      apiKeys: config.apiKeys,
+      baseURL: config.routerBaseURL || config.baseURL,
+      defaultModel: config.routerModel,
+      apiMode: config.routerApiMode || config.apiMode,
+      reasoningMode: config.reasoningMode,
+      contextWindowKB: config.contextWindowKB,
+      proxyEnabled: config.proxyEnabled,
+      proxyURL: config.proxyURL,
+      proxyBypassLocal: config.proxyBypassLocal,
+    })
+    : undefined;
 
   const graph = new StateGraph(ChapterState)
     .addNode("prewrite", async (state: ChapterStateType) => {
@@ -282,6 +396,8 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       return { prewriteCheck };
     })
     .addNode("intent", async (state: ChapterStateType) => {
+      // 三层级联路由：① 规则（显式绑定/强制技能/唯一领先的词面命中）
+      // ② 小模型结合会话语境路由（指代消解、意图延续） ③ 广谱注入兜底。
       const selection = selectSkillsByIntent(state.instruction, state.skillCatalog);
       const isWriting = selection.skills.some(skill => skill.category === "write") || /章节|正文|续写|创作|写作/u.test(state.instruction);
       const mandatoryNames = isWriting
@@ -289,13 +405,40 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         : [];
       const mandatory = mandatoryNames.map(name => state.skillCatalog.find(skill => skill.name === name)).filter((skill): skill is SkillDefinition => Boolean(skill));
       const preferred = state.preferredSkillNames.map(name => state.skillCatalog.find(skill => skill.name === name)).filter((skill): skill is SkillDefinition => Boolean(skill));
-      const selectedSkills = [...mandatory, ...preferred, ...selection.skills].filter((skill, index, list) => list.findIndex(item => item.name === skill.name) === index).slice(0, 6);
+      let routedSkills = selection.skills;
+      let routingMode = "规则匹配";
+      let routerUsage: UsageTotals | undefined;
+      if (!selection.confident && state.skillCatalog.length) {
+        // 第二层：廉价小模型分类（未配置 routerModel 时跳过，长尾直接交给主模型）。
+        if (routerClient) {
+          const fastRoute = await routeSkillsWithModel(state.instruction, state.skillCatalog, state.sessionContext, routerClient.chat.bind(routerClient), "fast");
+          routerUsage = addUsage(routerUsage, fastRoute?.usage);
+          if (fastRoute && fastRoute.confidence >= 0.6 && fastRoute.skills.length) {
+            routedSkills = fastRoute.skills;
+            routingMode = "小模型路由";
+          }
+        }
+        // 第三层：主模型处理真正的长尾语义；广谱注入只做最后兜底。
+        if (routingMode !== "小模型路由") {
+          const strongRoute = await routeSkillsWithModel(state.instruction, state.skillCatalog, state.sessionContext, client.chat.bind(client), "strong");
+          routerUsage = addUsage(routerUsage, strongRoute?.usage);
+          if (strongRoute && strongRoute.confidence >= 0.6 && strongRoute.skills.length) {
+            routedSkills = strongRoute.skills;
+            routingMode = "大模型路由";
+          } else {
+            routedSkills = broadSkillFallback(state.skillCatalog);
+            routingMode = strongRoute ? "低置信广谱兜底" : "路由失败广谱兜底";
+          }
+        }
+      }
+      const selectedSkills = [...mandatory, ...preferred, ...routedSkills].filter((skill, index, list) => list.findIndex(item => item.name === skill.name) === index).slice(0, 6);
       const preferenceMessage = preferred.length ? `；手动优先：${preferred.map(skill => skill.name).join("、")}` : "";
-      emitter?.progress("intent", 8, `工具 SkillRouter：识别意图“${selection.intent}”；已选技能：${selectedSkills.map(skill => skill.displayName || skill.name).join("、") || "默认写作规则"}${preferenceMessage}`);
-      emitter?.context("intent", "自动匹配写作技能", { source: "SkillRouter", status: "selected", items: selectedSkills.length });
+      emitter?.progress("intent", 8, `工具 SkillRouter（${routingMode}）：识别意图“${selection.intent}”；已选技能：${selectedSkills.map(skill => skill.displayName || skill.name).join("、") || "默认写作规则"}${preferenceMessage}`);
+      emitter?.context("intent", `技能路由完成（${routingMode}）`, { source: routingMode === "规则匹配" ? "SkillRouter.rules" : "SkillRouter.model", status: "selected", items: selectedSkills.length });
       return {
         recognizedIntent: selection.intent,
         selectedSkills: selectedSkills.map(skill => skill.name),
+        upstreamUsage: addUsage(state.upstreamUsage, routerUsage),
       };
     })
     .addNode("retrieve", async (state: ChapterStateType) => {
@@ -343,11 +486,11 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         return true;
       }).slice(0, 7);
       
-      let remaining = 4600;
+      let remaining = memoryBudgetBytes;
       const context = results.flatMap(r => {
         if (remaining < 180) return [];
         const heading = `[${r.type} · ${compactText(r.title, 120)}]`;
-        const content = compactText(r.content, Math.max(150, Math.min(760, remaining - byteLength(heading) - 8)));
+        const content = compactText(r.content, Math.max(150, Math.min(memoryPerItemCap, remaining - byteLength(heading) - 8)));
         const item = `${heading}\n${content}`;
         remaining -= byteLength(item) + 2;
         return content ? [item] : [];
@@ -379,16 +522,16 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const skillSection = state.skillCatalog
         .filter(skill => state.selectedSkills.includes(skill.name))
         .slice(0, 6)
-        .map(skill => `### ${skill.displayName || skill.name}\n${compactText(skill.content, 420)}`)
+        .map(skill => `### ${skill.displayName || skill.name}\n${compactText(skill.content, scaleCap(420))}`)
         .join("\n\n");
       const stablePacket = stableProjectPacket(state);
       const session = splitSessionContext(state.sessionContext);
       const planPrompt = [
-        state.outline ? "## 章节细纲\n" + compactText(state.outline, 1800) : "",
-        state.continuityContext ? "## 上一章承接（最高优先级）\n" + compactText(state.continuityContext, 3200) : "",
-        state.earlierMemorySummary ? "## 更早章节压缩摘要（仅作连续性参考）\n" + compactText(state.earlierMemorySummary, 4200) : "",
-        state.retrievedContext.length ? "## 结构化记忆\n" + compactText(state.retrievedContext.join("\n\n"), 2600) : "",
-        state.knowledgeGraph ? "## 相关知识图谱\n" + compactText(state.knowledgeGraph, 1800) : "",
+        state.outline ? "## 章节细纲\n" + compactText(state.outline, scaleCap(1800)) : "",
+        state.continuityContext ? "## 上一章承接（最高优先级）\n" + compactText(state.continuityContext, scaleCap(3200)) : "",
+        state.earlierMemorySummary ? "## 更早章节压缩摘要（仅作连续性参考）\n" + compactText(state.earlierMemorySummary, scaleCap(4200)) : "",
+        state.retrievedContext.length ? "## 结构化记忆\n" + compactText(state.retrievedContext.join("\n\n"), scaleCap(2600)) : "",
+        state.knowledgeGraph ? "## 相关知识图谱\n" + compactText(state.knowledgeGraph, scaleCap(1800)) : "",
         skillSection ? "## 执行技能\n" + skillSection : "",
         state.prewriteCheck?.warnings.length ? `## 写前提醒\n${state.prewriteCheck.warnings.map(item => `- ${item}`).join("\n")}` : "",
       ].filter(Boolean).join("\n\n");
@@ -430,14 +573,14 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         ? `\n## 本章知识卡片\n${state.cards.map(card => `### ${card.type || "知识卡"}：${card.title}\n${card.content}`).join("\n\n")}\n`
         : "";
       const skillsSection = state.selectedSkills.length
-        ? `\n## 意图识别\n${state.recognizedIntent || "章节创作与续写"}\n\n## 自动选用技能\n${state.skillCatalog.filter(skill => state.selectedSkills.includes(skill.name)).slice(0, 3).map(skill => `### ${skill.displayName || skill.name}\n${compactText(skill.content, skill.name === "chapter-continuity" ? 1800 : 700)}`).join("\n\n")}\n`
+        ? `\n## 意图识别\n${state.recognizedIntent || "章节创作与续写"}\n\n## 自动选用技能\n${state.skillCatalog.filter(skill => state.selectedSkills.includes(skill.name)).slice(0, 3).map(skill => `### ${skill.displayName || skill.name}\n${skill.content}`).join("\n\n")}\n`
         : "";
 
       const continuitySection = state.continuityContext
         ? `\n## 章节承接（最高优先级）\n${state.continuityContext}\n`
         : "";
       const earlierMemorySection = state.earlierMemorySummary
-        ? `\n## 更早章节压缩摘要（只用于补足连续性，不得覆盖上一章）\n${compactText(state.earlierMemorySummary, 4200)}\n`
+        ? `\n## 更早章节压缩摘要（只用于补足连续性，不得覆盖上一章）\n${state.earlierMemorySummary}\n`
         : "";
       const planSection = state.chapterPlan ? `\n## 下一章计划（必须执行）\n${state.chapterPlan}\n` : "";
       // Keep project facts first and byte-stable; only the dynamic turn changes after it.
@@ -497,17 +640,18 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         ? `\n## 已知背景信息\n${state.retrievedContext.join("\n\n")}\n`
         : "";
       const cardsSection = state.cards?.length
-        ? `\n## 本章引用卡片状态\n${state.cards.map(card => `${card.title}：${compactText(card.content, 260)}`).join("\n")}`
+        ? `\n## 本章引用卡片状态\n${state.cards.map(card => `${card.title}：${card.content}`).join("\n")}`
         : "";
       const graphSection = state.knowledgeGraph
         ? `\n## 知识图谱约束\n${state.knowledgeGraph}\n`
         : "";
       const earlierMemorySection = state.earlierMemorySummary
-        ? `\n## 更早章节压缩摘要\n${compactText(state.earlierMemorySummary, 4200)}\n`
+        ? `\n## 更早章节压缩摘要\n${state.earlierMemorySummary}\n`
         : "";
 
       const reviewConstraints = `${cardsSection}${graphSection}${earlierMemorySection}${contextSection}`;
-      const reviewDraft = compactText(state.draftContent, 10000);
+      // 正文与卡片全文注入：审查找的是事实矛盾，截断会让章节尾部与状态细节逃过检查。
+      const reviewDraft = state.draftContent;
       const reviewPrompt = `## 约束摘要\n${reviewConstraints || "（暂无额外约束）"}\n\n## 待审查章节\n${reviewDraft}`;
       const stablePacket = stableProjectPacket(state);
       const session = splitSessionContext(state.sessionContext);

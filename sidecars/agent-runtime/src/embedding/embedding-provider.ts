@@ -1,6 +1,6 @@
 /**
  * Embedding Provider Interface
- * 支持多种 embedding 后端：本地模型、API Saver、OpenAI 兼容接口
+ * 使用本地 Transformers.js 轻量模型生成向量，全程离线、零 API 费用
  */
 
 export interface EmbeddingVector {
@@ -12,79 +12,6 @@ export interface EmbeddingProvider {
   embed(text: string): Promise<EmbeddingVector>;
   embedBatch(texts: string[]): Promise<EmbeddingVector[]>;
   getDimensions(): number;
-}
-
-/**
- * API Saver Embedding Provider
- * 通过 API Saver 调用远程 embedding 模型
- */
-export class ApiSaverEmbeddingProvider implements EmbeddingProvider {
-  private dimensions: number;
-
-  constructor(
-    private apiKey: string,
-    private baseURL: string = "https://api.apisaver.com/v1",
-    private model: string = "text-embedding-3-small",
-    dimensions?: number
-  ) {
-    // text-embedding-3-small 默认 1536 维
-    // bge-small-zh-v1.5 默认 512 维
-    this.dimensions = dimensions || 1536;
-  }
-
-  getDimensions(): number {
-    return this.dimensions;
-  }
-
-  async embed(text: string): Promise<EmbeddingVector> {
-    const response = await fetch(`${this.baseURL}/embeddings`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.model,
-        input: text,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Embedding API failed: ${response.statusText}`);
-    }
-
-    const data = await response.json() as { data: Array<{ embedding: number[] }> };
-    const embedding = data.data[0].embedding;
-    
-    return {
-      embedding,
-      dimensions: embedding.length,
-    };
-  }
-
-  async embedBatch(texts: string[]): Promise<EmbeddingVector[]> {
-    const response = await fetch(`${this.baseURL}/embeddings`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.model,
-        input: texts,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Embedding API failed: ${response.statusText}`);
-    }
-
-    const data = await response.json() as { data: Array<{ embedding: number[] }> };
-    return data.data.map((item) => ({
-      embedding: item.embedding,
-      dimensions: item.embedding.length,
-    }));
-  }
 }
 
 /**

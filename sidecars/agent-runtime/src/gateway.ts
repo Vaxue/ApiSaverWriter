@@ -13,7 +13,9 @@ const port = Number(process.env.AGENT_GATEWAY_PORT || 8787);
 const allowedOrigin = process.env.AGENT_GATEWAY_ORIGIN || "*";
 const runtimeEntry = join(dirname(fileURLToPath(import.meta.url)), "main.js");
 let runtime: ChildProcessWithoutNullStreams | undefined;
-let lineBuffer = "";
+// NDJSON 分帧必须在 Buffer 层完成：若先把 chunk 转成字符串，多字节 UTF-8 字符
+// 恰好被切在两个 chunk 边界时会产生乱码，导致 JSON.parse 失败。
+let lineBuffer = Buffer.alloc(0);
 const pending = new Map<string, Pending>();
 
 const writeEvent = (response: ServerResponse, event: string, payload: unknown) => response.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
@@ -22,9 +24,12 @@ const ensureRuntime = () => {
   runtime = spawn(process.execPath, [runtimeEntry], { stdio: ["pipe", "pipe", "pipe"] });
   runtime.stderr.on("data", chunk => console.error(`[agent-runtime] ${String(chunk).trim()}`));
   runtime.stdout.on("data", chunk => {
-    lineBuffer += String(chunk);
-    const lines = lineBuffer.split("\n");
-    lineBuffer = lines.pop() || "";
+    lineBuffer = Buffer.concat([lineBuffer, chunk]);
+    const lines: string[] = [];
+    for (let index = lineBuffer.indexOf("\n"); index >= 0; index = lineBuffer.indexOf("\n")) {
+      lines.push(lineBuffer.subarray(0, index).toString("utf8"));
+      lineBuffer = lineBuffer.subarray(index + 1);
+    }
     for (const line of lines) {
       if (!line.trim()) continue;
       try {

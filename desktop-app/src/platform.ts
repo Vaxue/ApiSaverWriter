@@ -59,7 +59,7 @@ const memoryList = (value: unknown, limit = 40): string[] => {
   }).filter(Boolean).slice(0, limit);
 };
 const isQuotaExceeded = (value: string) => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/iu.test(value);
-const baseURL = (value: unknown) => {
+const baseURL = (_value: unknown) => {
   // Mobile clients use the managed ApiSaver gateway only. Ignore legacy
   // custom values restored from older app versions.
   return 'https://api.apisaver.com/v1';
@@ -204,9 +204,10 @@ const mobileHydrateDirectorySnapshots = (files: Record<string, string>) => {
     rankingBooks: mobileBundleJSON<unknown[]>(files, 'rankings/metadata.json') || [],
     writingStyles: (() => {
       const styles = mobileBundleJSON<unknown[]>(files, 'styles/metadata.json') || [];
-      return styles.map((style: Record<string, unknown>) => {
-        const sourcePath = typeof style.sourcePath === 'string' ? style.sourcePath : `${mobileBundleSafeName(style.name, '未命名文风')}.md`;
-        return { ...style, content: files[mobileBundlePath('styles', sourcePath)] ?? String(style.content || '') };
+      return styles.map(style => {
+        const record = style as Record<string, unknown>;
+        const sourcePath = typeof record.sourcePath === 'string' ? record.sourcePath : `${mobileBundleSafeName(record.name, '未命名文风')}.md`;
+        return { ...record, content: files[mobileBundlePath('styles', sourcePath)] ?? String(record.content || '') };
       });
     })(),
   };
@@ -363,7 +364,7 @@ const mobileBaiduUpload = async (remotePath: string, bytes: Uint8Array) => {
   const chunkSize = 4 * 1024 * 1024;
   const chunks: Uint8Array[] = [];
   for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) chunks.push(bytes.slice(offset, Math.min(offset + chunkSize, bytes.byteLength)));
-  const blockList = chunks.map(chunk => SparkMD5.ArrayBuffer.hash(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)));
+  const blockList = chunks.map(chunk => SparkMD5.ArrayBuffer.hash(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer));
   const path = `/apps/bdpan/${remotePath}/${baiduBackupName}`;
   const precreate = await mobileBaiduRequest<{ uploadid?: string; return_type?: number }>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'precreate', openapi: 'xpansdk', access_token: mobileBaiduToken() }), {
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -375,7 +376,7 @@ const mobileBaiduUpload = async (remotePath: string, bytes: Uint8Array) => {
     for (const [index, chunk] of chunks.entries()) {
       emitCloudProgress(`正在上传备份分片 ${index + 1}/${chunks.length}...`);
       const form = new FormData();
-      form.append('file', new Blob([chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)]), baiduBackupName);
+      form.append('file', new Blob([chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer]), baiduBackupName);
       await mobileBaiduRequest(mobileBaiduURL('https://d.pcs.baidu.com/rest/2.0/pcs/superfile2', { method: 'upload', openapi: 'xpansdk', type: 'tmpfile', access_token: mobileBaiduToken(), path, uploadid: uploadId, partseq: String(index) }), { method: 'POST', headers: { 'User-Agent': 'pan.baidu.com' }, body: form });
     }
     await mobileBaiduRequest(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'create', openapi: 'xpansdk', access_token: mobileBaiduToken() }), {
@@ -1200,6 +1201,11 @@ const mobileHtmlValue = (root: Element, rule: unknown, baseUrl: string): string 
   return '';
 };
 
+type MobileSearchBook = {
+  id: string; sourceId: string; sourceBookId: string; source: string; title: string; author: string;
+  intro: string; cover: string | undefined; category: string | undefined; wordCount: number | undefined; url: string;
+};
+
 const mobileSearchOneQianyueSource = async (source: MobileQianyueSource & { id: string; name: string }, query: string): Promise<Record<string, unknown>[]> => {
   const request = mobileSourceRequest(source, query);
   if (!request) return [];
@@ -1214,7 +1220,7 @@ const mobileSearchOneQianyueSource = async (source: MobileQianyueSource & { id: 
   try { json = JSON.parse(payload) as unknown; } catch { /* HTML source. */ }
   const baseUrl = mobileSourceBase(source) || request.url;
   const items = json !== null ? mobileJsonPath(json, rule.bookList) : mobileHtmlNodes(new DOMParser().parseFromString(payload, 'text/html'), String(rule.bookList || ''));
-  return items.map((item, index) => {
+  const mapped = items.map((item, index) => {
     const record = item && typeof item === 'object' ? item as Record<string, unknown> : {};
     const scalar = (field: string) => {
       if (json === null) return mobileHtmlValue(item instanceof Element ? item : document.createElement('div'), rule[field], baseUrl);
@@ -1240,7 +1246,8 @@ const mobileSearchOneQianyueSource = async (source: MobileQianyueSource & { id: 
       intro: mobileRuleText(scalar('intro'), rule.intro), cover: scalar('coverUrl') || undefined,
       category: mobileRuleText(scalar('kind'), rule.kind) || undefined, wordCount: Number(scalar('wordCount')) || undefined, url: bookUrl,
     };
-  }).filter((book): book is Record<string, unknown> => Boolean(book));
+  }).filter((book): book is MobileSearchBook => Boolean(book));
+  return mapped;
 };
 
 type MobileSourcePayload = { request: MobileSourceRequest; text: string; json: unknown | null };
@@ -1449,12 +1456,13 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
         const usagePayload = usage.status === 'fulfilled' ? usage.value : undefined;
         const logsPayload = logs.status === 'fulfilled' ? logs.value : undefined;
         const pricingPayload = pricing.status === 'fulfilled' ? pricing.value : undefined;
+        const usageData = usagePayload?.data && typeof usagePayload.data === 'object' ? usagePayload.data as Record<string, unknown> : undefined;
         return {
           keyIndex, keyHint: `${key.slice(0, 4)}••••${key.slice(-4)}`,
-          usage: usagePayload?.data && typeof usagePayload.data === 'object' ? usagePayload.data : undefined,
+          usage: usageData,
           logs: Array.isArray(logsPayload?.data) ? logsPayload.data : [],
           pricing: Array.isArray(pricingPayload?.data) ? pricingPayload.data : [],
-          group: typeof usagePayload?.data?.group === 'string' ? usagePayload.data.group : undefined,
+          group: typeof usageData?.group === 'string' ? usageData.group : undefined,
           groupRatios: pricingPayload?.group_ratio && typeof pricingPayload.group_ratio === 'object' ? pricingPayload.group_ratio as Record<string, number> : undefined,
           usableGroups: pricingPayload?.usable_group && typeof pricingPayload.usable_group === 'object' ? pricingPayload.usable_group as Record<string, unknown> : undefined,
           ...(errors.length ? { error: errors.join('；') } : {}),
@@ -1462,9 +1470,10 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
       })),
     ]);
     const pricing = accounts.flatMap(account => account.pricing || []).filter((item, index, all) => all.findIndex(other => String(other.model_name) === String(item.model_name)) === index);
+    const statusData = (statusResult as Record<string, unknown>).data;
     return {
       fetchedAt: new Date().toISOString(),
-      status: statusResult.data && typeof statusResult.data === 'object' ? statusResult.data : undefined,
+      status: statusData && typeof statusData === 'object' ? statusData : undefined,
       pricing,
       accounts,
       errors: [statusResult.__error].filter((value): value is string => typeof value === 'string'),

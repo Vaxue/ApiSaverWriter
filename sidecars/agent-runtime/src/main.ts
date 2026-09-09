@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createChapterGraph, selectSkillsByIntent, type SkillDefinition } from "./graphs/chapter-write.graph.js";
 import { StoryStore } from "./storage/story-store.js";
+import { LocalEmbeddingProvider } from "./embedding/embedding-provider.js";
 import { ApiSaverClient, getRuntimeUsageSummary } from "./models/api-saver.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
 import { byteLength, compactKnowledgeGraph, compactText, contextBudgetBytes, LruCache, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
@@ -9,6 +10,9 @@ import { ProxyAgent } from "undici";
 import { load as loadHtml } from "cheerio";
 import iconv from "iconv-lite";
 import { createDecipheriv } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import qianyueSourceData from "./data/qianyue-novel-sources.json" with { type: "json" };
 import fanqiePuaMaps from "./data/fanqie-pua-map.json" with { type: "json" };
 
@@ -28,6 +32,35 @@ interface RPCResponse {
 // normal editor actions without persisting any novel material outside memory.
 const chapterPreparationCache = new LruCache<PreparedChapterInput>(48);
 const chapterMemoryCache = new LruCache<Record<string, unknown>>(96);
+
+// 共享 StoryStore：跨请求持久化记忆与向量索引（SQLite + sqlite-vec），
+// 向量用本地 MiniLM 模型生成，全程离线、零 API 费用。
+let sharedStoryStore: StoryStore | undefined;
+let sharedEmbeddingProvider: LocalEmbeddingProvider | undefined;
+
+function storyDatabasePath(): string {
+  return process.env.APISAVERWRITER_STORY_DB
+    || join(homedir(), ".apisaverwriter", "story.sqlite");
+}
+
+function getSharedStoryStore(): StoryStore {
+  if (!sharedStoryStore) {
+    const dbPath = storyDatabasePath();
+    mkdirSync(dirname(dbPath), { recursive: true });
+    sharedStoryStore = StoryStore.open(dbPath);
+    try {
+      if (!sharedEmbeddingProvider) sharedEmbeddingProvider = new LocalEmbeddingProvider();
+      sharedStoryStore.enableVectorSearch(sharedEmbeddingProvider);
+    } catch (err) {
+      // sqlite-vec 扩展加载失败等场景：检索降级为纯 FTS5，写作流程不受影响
+      console.warn("向量检索启用失败，已降级为纯 FTS5 检索:", err);
+    }
+    process.once("exit", () => {
+      try { sharedStoryStore?.close(); } catch { /* 进程退出时尽力而为 */ }
+    });
+  }
+  return sharedStoryStore;
+}
 type AgentSessionTurn = {
   instruction: string;
   conclusion: string;
@@ -2470,13 +2503,19 @@ ${compactText(content, 26000)}
       if (!projectId || !chapterId || !instruction || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
-      const store = StoryStore.inMemory();
+      const store = getSharedStoryStore();
       const runId = typeof req.params?.runId === "string" ? req.params.runId : "";
       const streamEmitter = new StreamEmitter();
       streamEmitter.subscribe(event => {
         process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event }) + "\n");
       });
       streamEmitter.progress("starting", 3, "运行环境已就绪，正在整理本章资料");
+      // 已确认记忆写入后异步向量化，供本地语义检索使用；失败不阻塞写作
+      const pendingVectors: Array<{ id: string; content: string }> = [];
+      const saveMemoryWithVector = (memory: Parameters<typeof store.saveMemory>[0]) => {
+        store.saveMemory(memory);
+        if (memory.confirmed) pendingVectors.push({ id: memory.id, content: memory.content });
+      };
       const preparationKey = stableHash(cacheStableContext({
         projectId, chapterId, instruction, outline, outlines, activeOutlineId, cards,
         previousChapters, memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills, preferredSkillNames,
@@ -2519,7 +2558,7 @@ ${compactText(content, 26000)}
           const item = chapter as Record<string, unknown>;
           const content = String(item.content || "").trim();
           if (!content) return;
-          store.saveMemory({
+          saveMemoryWithVector({
             id: `chapter-memory-${String(item.id || index)}`,
             projectId: normalizedProjectId,
             type: "event",
@@ -2568,7 +2607,7 @@ ${compactText(content, 26000)}
           const content = String(item.content || "").trim();
           if (!content) return;
           const kind = String(item.kind || item.title || "章节快照");
-          store.saveMemory({
+          saveMemoryWithVector({
             id: `memory-document-${kind}-${index}`,
             projectId: normalizedProjectId,
             type: memoryTypeForDocument(kind),
@@ -2587,6 +2626,11 @@ ${compactText(content, 26000)}
           apiKeys: stringList(apiKeys, 12),
           baseURL: String(baseURL || "https://api.apisaver.com/v1"),
           model: String(model || "gpt-4o-mini"),
+          routerModel: typeof req.params?.routerModel === "string" && req.params.routerModel.trim() ? req.params.routerModel.trim() : undefined,
+          routerBaseURL: typeof req.params?.routerBaseURL === "string" && req.params.routerBaseURL.trim() ? req.params.routerBaseURL.trim() : undefined,
+          routerApiKey: typeof req.params?.routerApiKey === "string" && req.params.routerApiKey.trim() ? req.params.routerApiKey.trim() : undefined,
+          routerApiMode: ["openai", "responses", "anthropic"].includes(String(req.params?.routerApiMode)) ? String(req.params?.routerApiMode) as "openai" | "responses" | "anthropic" : undefined,
+          memoryBudgetChars: Number(req.params?.memoryBudgetChars) || undefined,
           apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
           reasoningMode: String(reasoningMode || "auto"),
           contextWindowKB: Number(contextWindow) || undefined,
@@ -2634,9 +2678,8 @@ ${compactText(content, 26000)}
       } catch (error) {
         streamEmitter.error(error instanceof Error ? error.message : String(error));
         throw error;
-      } finally {
-        store.close();
       }
+      // 共享 store 跨请求复用，不在此处 close；进程退出时统一关闭
     }
     return { id: req.id, error: { code: -32601, message: "Method not found" } };
   } catch (err) {
