@@ -801,7 +801,9 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   const model = stringValue(params.model, local ? 'MiniCPM5-2B-Q4_K_M' : 'gpt-4o-mini');
   if (local) {
     const nativeResult = await nativeInvoke<{ content?: string; usage?: unknown }>('mobile_local_chat', {
-      params: { messages, max_tokens: jsonMode ? 1300 : 6000, temperature: jsonMode ? 0.2 : 0.7, contextWindow: params.contextWindow || 4096 },
+      // iOS/Android native inference is memory constrained; the Rust bridge
+      // applies the same hard limits and truncates oversized prompts safely.
+      params: { messages, max_tokens: jsonMode ? 768 : 1024, temperature: jsonMode ? 0.2 : 0.7, contextWindow: Math.min(params.contextWindow || 2048, 2048) },
     });
     const content = stringValue(nativeResult?.content);
     if (content && onChunk) onChunk(content);

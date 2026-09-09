@@ -12,8 +12,9 @@ Android 与 iOS 不启动桌面 Node 子进程，直接通过 Tauri 原生 HTTP 
 
 iOS/Android 现在支持将 `MiniCPM5-2B-Q4_K_M.gguf` 直接作为 Tauri mobile 资源打包，并通过 Rust 原生 `llama-cpp-4` 在设备内部推理：
 
-- iOS：llama.cpp CPU 原生后端（首个稳定构建；Metal 后端待独立 Xcode toolchain 验证）
+- iOS：llama.cpp Metal 原生后端（减少 CPU 内存压力）
 - Android：llama.cpp CPU/NEON 基线后端
+- 移动端本地推理硬限制为 2048 context / 1024 output tokens，避免 iOS 内存压力导致系统直接杀进程
 - 手机不需要局域网电脑、不需要 API Key、不启动 `llama-server`
 - 本地模型请求通过 Tauri command 进入原生推理，不经过 HTTP
 

@@ -23,10 +23,10 @@ serde_json = "1"
 flate2 = "1"
 
 [target.'cfg(target_os = "ios")'.dependencies]
-# iOS uses the CPU backend for the first stable native build. Metal is
-# intentionally disabled here because llama-cpp-sys currently emits a
-# Catalyst/macOS runtime object when cross-linking from this CI toolchain.
-llama-cpp-4 = { version = "0.5.0", default-features = false }
+# iOS uses llama.cpp Metal so model layers stay off the CPU heap. The local
+# vendor patch keeps iPhoneOS framework linking separate from macOS runtime
+# linking.
+llama-cpp-4 = { version = "0.5.0", default-features = false, features = ["metal"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # CPU NEON is the conservative Android baseline; Vulkan can be enabled in a

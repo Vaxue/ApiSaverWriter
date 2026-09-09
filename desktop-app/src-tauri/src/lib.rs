@@ -384,6 +384,11 @@ fn mobile_local_models(app: tauri::AppHandle) -> Result<Value, String> {
 
 #[tauri::command]
 fn mobile_local_chat(app: tauri::AppHandle, params: Value) -> Result<Value, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mobile_local_chat_inner(app, params)))
+        .map_err(|_| "本地模型发生内存或原生推理异常，请降低上下文后重试".to_string())?
+}
+
+fn mobile_local_chat_inner(app: tauri::AppHandle, params: Value) -> Result<Value, String> {
     #[cfg(any(target_os = "ios", target_os = "android"))]
     {
         use llama_cpp_4::prelude::*;
@@ -393,7 +398,10 @@ fn mobile_local_chat(app: tauri::AppHandle, params: Value) -> Result<Value, Stri
         let model_path = bundled_local_model_resource(&app, "MiniCPM5-2B-Q4_K_M.gguf")
             .ok_or_else(|| "移动端安装包没有 MiniCPM5-2B-Q4_K_M.gguf；请使用带模型资源的移动端构建".to_string())?;
         let backend = LlamaBackend::init().map_err(|error| format!("初始化本地推理后端失败：{error}"))?;
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(0);
+        // Metal keeps the quantized layers out of the iOS CPU heap. Android
+        // remains on the conservative CPU/NEON path.
+        let model_params = LlamaModelParams::default()
+            .with_n_gpu_layers(if cfg!(target_os = "ios") { 99 } else { 0 });
         let model_params = pin!(model_params);
         let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
             .map_err(|error| format!("加载 MiniCPM5 模型失败：{error}"))?;
@@ -411,11 +419,28 @@ fn mobile_local_chat(app: tauri::AppHandle, params: Value) -> Result<Value, Stri
             .map_err(|error| format!("应用 MiniCPM5 对话模板失败：{error}"))?;
         let tokens = model.str_to_token(&prompt, AddBos::Always)
             .map_err(|error| format!("本地模型分词失败：{error}"))?;
-        let context_size = params.get("contextWindow").and_then(Value::as_u64).unwrap_or(4096).clamp(1024, 8192) as u32;
-        let max_tokens = params.get("max_tokens").and_then(Value::as_u64).unwrap_or(1536).clamp(1, 4096) as usize;
+        // A full chapter prompt plus a 4k KV cache exceeds the practical
+        // memory budget of many iPhones. Keep a hard native limit so llama.cpp
+        // returns an error instead of aborting inside a too-large decode.
+        let context_size = params.get("contextWindow").and_then(Value::as_u64).unwrap_or(2048).clamp(1024, 2048) as u32;
+        let max_tokens = params.get("max_tokens").and_then(Value::as_u64).unwrap_or(1024).clamp(1, 1024) as usize;
+        let prompt_limit = context_size.saturating_sub(max_tokens.min(768) as u32).max(256) as usize;
+        let tokens = if tokens.len() > prompt_limit {
+            // Keep the chat/template prefix and the newest user content. This
+            // avoids passing a batch larger than the context window.
+            let prefix = prompt_limit.min(256);
+            let suffix = prompt_limit.saturating_sub(prefix);
+            let mut compact = Vec::with_capacity(prompt_limit);
+            compact.extend_from_slice(&tokens[..prefix]);
+            compact.extend_from_slice(&tokens[tokens.len() - suffix..]);
+            compact
+        } else {
+            tokens
+        };
         let context_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(context_size))
-            .with_n_batch(512);
+            .with_n_batch(128)
+            .with_n_ubatch(128);
         let mut context = model.new_context(&backend, context_params)
             .map_err(|error| format!("创建本地推理上下文失败：{error}"))?;
         let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
