@@ -169,9 +169,37 @@ interface ReviewCenterReport {
   updatedAt: string;
 }
 
+// 全书巡检（跨章一致性）与逐章审查是两件事：前者只报跨章节矛盾，
+// 一次调用覆盖全书，结果单独存放，避免相互覆盖。
+interface BookAuditConflict {
+  severity: 'high' | 'medium' | 'low';
+  category: string;
+  entities: string[];
+  evidence: string;
+  chapters: number[];
+  suggestion: string;
+  handled?: boolean;
+}
+
+interface BookAuditReport {
+  score: number;
+  summary: string;
+  conflicts: BookAuditConflict[];
+  chapterCount: number;
+  memoryCount: number;
+  foreshadowCount: number;
+  model: string;
+  auditedAt: string;
+}
+
 type MemoryDocumentKind = '章节快照' | '人物状态' | '角色认知' | '伏笔追踪' | '时间线' | '设定事实' | '冲突';
 
 type ForeshadowStatus = 'active' | 'progressing' | 'resolved' | 'overdue' | 'discarded';
+
+interface ForeshadowAlertConfig {
+  enabled: boolean;
+  agingChapters: number;
+}
 
 interface ForeshadowManualEntry {
   id: string;
@@ -201,6 +229,9 @@ interface ForeshadowBoardItem {
   lastChapterTitle?: string;
   manual: boolean;
   overdue: boolean;
+  // 距埋设已过去的章节数，以及“没有目标章但拖太久”的时效告警。
+  agedChapters?: number;
+  stale: boolean;
 }
 
 interface MemoryDocument {
@@ -341,12 +372,14 @@ interface Project {
   publishRecords?: PublishRecord[];
   aiDetection?: AIDetectionReport;
   reviewCenter?: ReviewCenterReport;
+  consistencyAudit?: BookAuditReport;
   chapterTargetWords?: number;
   styleProfileId?: string;
   sourceDismantleBookId?: string;
   authorPreferences?: string[];
   manualForeshadows?: ForeshadowManualEntry[];
   foreshadowOverrides?: Record<string, ForeshadowOverride>;
+  foreshadowAlertConfig?: ForeshadowAlertConfig;
 }
 
 type DismantleChapterStatus = 'pending' | 'analyzing' | 'analyzed' | 'rewritten' | 'failed';
@@ -881,6 +914,13 @@ const FORESHADOW_PRIORITY_ORDER: Record<ForeshadowPriority, number> = { high: 0,
 
 const normalizeForeshadowKey = (text: string) => text.replace(/\s+/gu, '');
 
+// 伏笔告警阈值：埋设后超过 agingChapters 章仍未回收即告警。可按作品调整。
+const defaultForeshadowAlertConfig: ForeshadowAlertConfig = { enabled: true, agingChapters: 20 };
+
+/** 未回收（含目标章超期与埋设过久两种情形）的伏笔才需要提醒作者。 */
+const isForeshadowAlert = (item: ForeshadowBoardItem) =>
+  item.status !== 'resolved' && item.status !== 'discarded' && (item.overdue || item.stale);
+
 const orderedProjectMemories = (project: Project) => {
   const chapterOrder = new Map(project.chapters.map((chapter, index) => [chapter.id, index]));
   return [...project.memories].sort((left, right) =>
@@ -890,6 +930,9 @@ const orderedProjectMemories = (project: Project) => {
 const aggregateForeshadowBoard = (project: Project): ForeshadowBoardItem[] => {
   const orderedMemories = orderedProjectMemories(project);
   const writtenChapterCount = project.chapters.filter(chapter => chapter.content.trim()).length;
+  const alertConfig = { ...defaultForeshadowAlertConfig, ...(project.foreshadowAlertConfig || {}) };
+  // 章节序号兜底：记忆没写 sourceChapterNumber 时用章节在作品中的位置。
+  const chapterOrderIndex = new Map(project.chapters.map((chapter, index) => [chapter.id, index + 1]));
   const aggregated = new Map<string, ForeshadowBoardItem>();
   // 按章节顺序吸收：status/priority/targetChapter 以最新章为准，plantedChapter 取最早。
   const absorb = (text: string, source: Partial<ForeshadowBoardItem>) => {
@@ -897,7 +940,7 @@ const aggregateForeshadowBoard = (project: Project): ForeshadowBoardItem[] => {
     if (!key) return;
     const existing = aggregated.get(key);
     if (!existing) {
-      aggregated.set(key, { key, sourceKey: key, text: text.trim(), status: 'active', priority: 'normal', manual: false, overdue: false, ...source });
+      aggregated.set(key, { key, sourceKey: key, text: text.trim(), status: 'active', priority: 'normal', manual: false, overdue: false, stale: false, ...source });
       return;
     }
     if (source.status) existing.status = source.status;
@@ -911,6 +954,9 @@ const aggregateForeshadowBoard = (project: Project): ForeshadowBoardItem[] => {
     existing.manual = existing.manual || Boolean(source.manual);
   };
   for (const memory of orderedMemories) {
+    const memoryChapterNumber = Number(memory.sourceChapterNumber) > 0
+      ? Number(memory.sourceChapterNumber)
+      : chapterOrderIndex.get(memory.chapterId);
     for (const item of memory.foreshadowingItems || []) {
       const text = String(item?.text || '').trim();
       if (!text) continue;
@@ -919,7 +965,9 @@ const aggregateForeshadowBoard = (project: Project): ForeshadowBoardItem[] => {
       absorb(text, {
         status,
         priority,
-        plantedChapter: typeof item.plantedChapter === 'number' ? item.plantedChapter : undefined,
+        // 智能体没给 plantedChapter 时，用该伏笔首次被记录的章节兜底，
+        // 否则「埋设多久没回收」无从判断，时效告警会永远不触发。
+        plantedChapter: typeof item.plantedChapter === 'number' ? item.plantedChapter : memoryChapterNumber,
         targetChapter: typeof item.targetChapter === 'number' ? item.targetChapter : undefined,
         lastChapterId: memory.chapterId,
         lastChapterTitle: memory.chapterTitle,
@@ -944,8 +992,11 @@ const aggregateForeshadowBoard = (project: Project): ForeshadowBoardItem[] => {
       const override = overrides[item.key];
       const renamed = override?.text?.trim() ? override.text.trim() : '';
       const status = override?.status || item.status;
+      const open = status === 'active' || status === 'progressing' || status === 'overdue';
       const overdue = (status === 'active' || status === 'progressing') && typeof item.targetChapter === 'number' && item.targetChapter < writtenChapterCount;
-      return { ...item, key: renamed ? normalizeForeshadowKey(renamed) : item.key, sourceKey: item.key, text: renamed || item.text, status, overdue: overdue || status === 'overdue' };
+      const agedChapters = typeof item.plantedChapter === 'number' ? Math.max(0, writtenChapterCount - item.plantedChapter) : undefined;
+      const stale = alertConfig.enabled && open && typeof agedChapters === 'number' && agedChapters >= alertConfig.agingChapters;
+      return { ...item, key: renamed ? normalizeForeshadowKey(renamed) : item.key, sourceKey: item.key, text: renamed || item.text, status, overdue: overdue || status === 'overdue', agedChapters, stale };
     })
     .sort((left, right) =>
       FORESHADOW_STATUS_ORDER[left.status] - FORESHADOW_STATUS_ORDER[right.status]
@@ -1711,7 +1762,8 @@ function App() {
   const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'search' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'foreshadow' | 'publish' | 'ai-detect' | 'review' | 'export'>('chapters');
   const [aiDetecting, setAIDetecting] = useState(false);
   const [reviewRunning, setReviewRunning] = useState(false);
-  const [reviewScope, setReviewScope] = useState<'selected' | 'book'>('selected');
+  const [bookAuditRunning, setBookAuditRunning] = useState(false);
+  const [reviewScope, setReviewScope] = useState<'selected' | 'book' | 'audit'>('selected');
   const [reviewSidebarPage, setReviewSidebarPage] = useState<ReviewSidebarPage>('home');
   const [selectedReviewChapterIds, setSelectedReviewChapterIds] = useState<number[]>([]);
   const [reviewActiveChapterId, setReviewActiveChapterId] = useState<number | null>(null);
@@ -1725,21 +1777,33 @@ function App() {
   const [activeGraphNodeId, setActiveGraphNodeId] = useState<string | null>(null);
   const [graphViewMode, setGraphViewMode] = useState<'document' | 'graph'>('document');
   const [foreshadowView, setForeshadowView] = useState<'board' | 'timeline'>('board');
-  const [foreshadowFilter, setForeshadowFilter] = useState<'all' | 'open' | 'overdue' | 'resolved' | 'discarded'>('all');
+  const [foreshadowFilter, setForeshadowFilter] = useState<'all' | 'open' | 'alert' | 'overdue' | 'resolved' | 'discarded'>('all');
   const [showForeshadowForm, setShowForeshadowForm] = useState(false);
   const [foreshadowFormDraft, setForeshadowFormDraft] = useState<{ text: string; priority: ForeshadowPriority; plantedChapter: string; targetChapter: string }>({ text: '', priority: 'normal', plantedChapter: '', targetChapter: '' });
   const [editingForeshadowKey, setEditingForeshadowKey] = useState<string | null>(null);
   const [editingForeshadowDraft, setEditingForeshadowDraft] = useState('');
   const foreshadowBoardItems = useMemo(() => (editingProject ? aggregateForeshadowBoard(editingProject) : []), [editingProject]);
   const foreshadowTimelineEntries = useMemo(() => (editingProject ? aggregateTimeline(editingProject) : []), [editingProject]);
+  const foreshadowAlertConfig = useMemo(
+    () => ({ ...defaultForeshadowAlertConfig, ...(editingProject?.foreshadowAlertConfig || {}) }),
+    [editingProject],
+  );
+  const foreshadowAlertItems = useMemo(
+    () => foreshadowBoardItems.filter(isForeshadowAlert).sort((left, right) =>
+      FORESHADOW_PRIORITY_ORDER[left.priority] - FORESHADOW_PRIORITY_ORDER[right.priority]
+      || (right.agedChapters ?? 0) - (left.agedChapters ?? 0)),
+    [foreshadowBoardItems],
+  );
   const foreshadowBoardStats = useMemo(() => ({
     active: foreshadowBoardItems.filter(item => item.status === 'active').length,
     progressing: foreshadowBoardItems.filter(item => item.status === 'progressing').length,
     open: foreshadowBoardItems.filter(item => item.status === 'active' || item.status === 'progressing' || (item.overdue && item.status !== 'resolved' && item.status !== 'discarded')).length,
     overdue: foreshadowBoardItems.filter(item => item.overdue && item.status !== 'resolved' && item.status !== 'discarded').length,
+    stale: foreshadowBoardItems.filter(item => item.stale && item.status !== 'resolved' && item.status !== 'discarded').length,
+    alert: foreshadowAlertItems.length,
     resolved: foreshadowBoardItems.filter(item => item.status === 'resolved').length,
     discarded: foreshadowBoardItems.filter(item => item.status === 'discarded').length,
-  }), [foreshadowBoardItems]);
+  }), [foreshadowBoardItems, foreshadowAlertItems]);
   const [graphDocumentGroup, setGraphDocumentGroup] = useState('');
   const [graphDocumentQuery, setGraphDocumentQuery] = useState('');
   const [graphDocumentType, setGraphDocumentType] = useState('全部类型');
@@ -5305,7 +5369,7 @@ function App() {
         });
         results.push({ chapterId: chapter.id, chapterTitle: chapter.title, score: Math.max(0, Math.min(100, Number(result.score) || 0)), summary: String(result.summary || '审查完成'), issues: Array.isArray(result.issues) ? result.issues : [], suggestions: Array.isArray(result.suggestions) ? result.suggestions : [], reviewedAt: new Date().toISOString() });
       }
-      const report: ReviewCenterReport = { scope: reviewScope, chapters: results, updatedAt: new Date().toISOString() };
+      const report: ReviewCenterReport = { scope: reviewScope === 'book' ? 'book' : 'selected', chapters: results, updatedAt: new Date().toISOString() };
       const latestProject = projectsRef.current.find(item => item.id === editingProject.id) || editingProject;
       const updated = { ...latestProject, reviewCenter: report, updatedAt: report.updatedAt };
       const nextProjects = projectsRef.current.map(item => item.id === updated.id ? updated : item);
@@ -5320,6 +5384,154 @@ function App() {
       setNotice({ title: '审查失败', content: String(error) });
     } finally {
       setReviewRunning(false);
+    }
+  };
+
+  /** 落盘一份完整的作品快照。巡检结果、伏笔阈值这类跨会话数据必须持久化，
+   * 否则重开应用就丢，作者会以为功能坏了。 */
+  const commitProjectUpdate = async (updated: Project) => {
+    const nextProjects = projectsRef.current.some(project => project.id === updated.id)
+      ? projectsRef.current.map(project => project.id === updated.id ? updated : project)
+      : [...projectsRef.current, updated];
+    projectsRef.current = nextProjects;
+    setEditingProject(updated);
+    setProjects(nextProjects);
+    if ('__TAURI_INTERNALS__' in window) await invoke<string>('save_projects', { projects: nextProjects });
+    else localStorage.setItem('projects', JSON.stringify(nextProjects));
+  };
+
+  const runBookAudit = async () => {
+    if (!editingProject || bookAuditRunning) return;
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写 API Saver Key，再运行全书巡检。' });
+      return;
+    }
+    const memories = orderedProjectMemories(editingProject);
+    if (!memories.length) {
+      setNotice({ title: '尚无章节记忆', content: '先保存带正文的章节，让智能体生成章节记忆后再巡检。' });
+      return;
+    }
+    setBookAuditRunning(true);
+    setNotice({ title: '全书巡检已启动', content: `正在比对 ${memories.length} 条章节记忆与设定资料，完成后会列出跨章矛盾。` });
+    try {
+      await invoke<string>('start_agent_runtime');
+      const board = aggregateForeshadowBoard(editingProject)
+        .filter(item => item.status !== 'resolved' && item.status !== 'discarded')
+        .slice(0, 80)
+        .map(item => ({
+          text: item.text,
+          status: item.status,
+          priority: item.priority,
+          plantedChapter: item.plantedChapter,
+          targetChapter: item.targetChapter,
+          agedChapters: item.agedChapters,
+          overdue: item.overdue,
+          stale: item.stale,
+        }));
+      const result = await invoke<{
+        score?: number;
+        summary?: string;
+        conflicts?: BookAuditConflict[];
+        stats?: { checkedChapters?: number; scannedMemories?: number; scannedForeshadows?: number };
+      }>('call_agent_rpc', {
+        method: 'book.audit',
+        params: {
+          projectTitle: editingProject.title,
+          memories,
+          cards: editingProject.cards.map(card => ({ type: card.type, title: card.title, content: card.content })),
+          outlines: editingProject.outlines
+            .filter(outline => outline.kind !== '章纲')
+            .map(outline => ({ kind: outline.kind, title: outline.title, content: outline.content })),
+          foreshadowBoard: board,
+          chapterCount: editingProject.chapters.length,
+          writtenChapterCount: editingProject.chapters.filter(chapter => chapter.content.trim()).length,
+          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim(), model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow,
+          ...agentNetworkParams(agentConfig),
+        },
+      });
+      const conflicts: BookAuditConflict[] = Array.isArray(result.conflicts)
+        ? result.conflicts.map(conflict => {
+          const severity: BookAuditConflict['severity'] = conflict.severity === 'high' || conflict.severity === 'low' ? conflict.severity : 'medium';
+          return {
+            severity,
+            category: String(conflict.category || '一致性'),
+            entities: Array.isArray(conflict.entities) ? conflict.entities.map(item => String(item)).filter(Boolean).slice(0, 8) : [],
+            evidence: String(conflict.evidence || ''),
+            chapters: Array.isArray(conflict.chapters) ? conflict.chapters.map(Number).filter(number => Number.isFinite(number) && number > 0).slice(0, 8) : [],
+            suggestion: String(conflict.suggestion || ''),
+          };
+        })
+        : [];
+      const report: BookAuditReport = {
+        score: Math.max(0, Math.min(100, Number(result.score) || 0)),
+        summary: String(result.summary || '巡检完成'),
+        conflicts,
+        chapterCount: Number(result.stats?.checkedChapters) || memories.length,
+        memoryCount: Number(result.stats?.scannedMemories) || memories.length,
+        foreshadowCount: Number(result.stats?.scannedForeshadows) || board.length,
+        model: agentConfig.model.trim() || fallbackModels[0],
+        auditedAt: new Date().toISOString(),
+      };
+      await commitProjectUpdate({ ...editingProject, consistencyAudit: report, updatedAt: report.auditedAt });
+      setNotice({
+        title: '全书巡检完成',
+        content: conflicts.length
+          ? `发现 ${conflicts.length} 条跨章问题，其中高优先 ${conflicts.filter(item => item.severity === 'high').length} 条。`
+          : '未发现明确的跨章矛盾，可以继续推进。',
+      });
+    } catch (error) {
+      setNotice({ title: '巡检失败', content: String(error) });
+    } finally {
+      setBookAuditRunning(false);
+    }
+  };
+
+  const toggleAuditConflictHandled = (index: number) => {
+    if (!editingProject?.consistencyAudit) return;
+    const audit = editingProject.consistencyAudit;
+    const conflicts = audit.conflicts.map((conflict, position) =>
+      position === index ? { ...conflict, handled: !conflict.handled } : conflict);
+    void commitProjectUpdate({ ...editingProject, consistencyAudit: { ...audit, conflicts }, updatedAt: new Date().toISOString() });
+  };
+
+  const openAuditChapter = (chapterNumber: number) => {
+    if (!editingProject || !chapterNumber) return;
+    const chapter = editingProject.chapters[chapterNumber - 1]
+      || editingProject.chapters.find(item => chapterNumberFromText(item.title) === chapterNumber);
+    if (!chapter) {
+      setNotice({ title: '未找到对应章节', content: `第 ${chapterNumber} 章不在当前作品中，可能已被删除或重命名。` });
+      return;
+    }
+    setActiveChapter(chapter);
+    setEditorSidebarTab('chapters');
+  };
+
+  const foreshadowAlertSummary = (items: ForeshadowBoardItem[]) => items.map(item => {
+    const lines = [`- ${item.text}`];
+    if (typeof item.plantedChapter === 'number') lines.push(`  埋设：第 ${item.plantedChapter} 章`);
+    if (typeof item.targetChapter === 'number') lines.push(`  目标回收：第 ${item.targetChapter} 章`);
+    if (item.overdue) lines.push('  状态：已超过目标章仍未回收');
+    else if (item.stale) lines.push(`  状态：已过 ${item.agedChapters} 章未回收`);
+    return lines.join('\n');
+  }).join('\n');
+
+  // 告警要能直接落到动作上：把清单塞进章节指令，比只在面板里看数字有用得多。
+  const injectForeshadowAlertIntoInstruction = () => {
+    if (!foreshadowAlertItems.length) return;
+    const picked = foreshadowAlertItems.slice(0, 10);
+    const block = `【待回收伏笔】以下线索埋设已久仍未回收，请在最近两章内安排自然回收或明确推进，不要让它们悬空：\n${foreshadowAlertSummary(picked)}`;
+    setAgentInstruction(current => (current.trim() ? `${current.trim()}\n\n${block}` : block));
+    setNotice({ title: '已写入本章指令', content: `已追加 ${picked.length} 条超期伏笔到章节智能体指令。` });
+  };
+
+  const copyForeshadowAlertList = async () => {
+    if (!foreshadowAlertItems.length) return;
+    const text = `《${editingProject?.title || '当前作品'}》待回收伏笔（${foreshadowAlertItems.length} 条）\n${foreshadowAlertSummary(foreshadowAlertItems)}`;
+    try {
+      await navigator.clipboard.writeText(text);
+      setNotice({ title: '已复制回收清单', content: `共 ${foreshadowAlertItems.length} 条，可粘贴到笔记或写作指令。` });
+    } catch {
+      setNotice({ title: '复制失败', content: '当前环境不允许访问剪贴板，请手动选中卡片内容。' });
     }
   };
 
@@ -6423,6 +6635,7 @@ function App() {
               <button className="editor-tool-button" title="搜索当前章节" onClick={() => { setShowSearchPanel(true); setSearchScope('chapter'); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索</button>
               <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}>标记</button>
               <button className="editor-tool-button" title="编辑禁词列表" onClick={() => { setBannedWordsDraft(bannedWords.join('\n')); setShowBannedWords(true); }}>禁词</button>
+              {foreshadowBoardStats.alert > 0 && <button className="editor-tool-button has-alert" title={`${foreshadowBoardStats.alert} 条伏笔埋设已久仍未回收，点击查看`} onClick={() => setEditorSidebarTab('foreshadow')}>伏笔告警 {foreshadowBoardStats.alert}</button>}
               <button className="btn-primary editor-save-button" disabled={!activeChapter || chapterSaving} onClick={persistCurrentChapter}>{chapterSaving ? '保存中...' : '保存章节'}</button>
               <div className="editor-stats">
                 <span>{autoSaveStatus === 'saving' ? '自动保存中' : autoSaveStatus === 'saved' ? '已自动保存' : autoSaveStatus === 'error' ? '保存失败' : '本地写作'}</span>
@@ -6499,10 +6712,11 @@ function App() {
                   记忆中心
                 </button>
                 <button
-                  className={editorSidebarTab === 'foreshadow' ? 'active' : ''}
+                  className={`${editorSidebarTab === 'foreshadow' ? 'active' : ''} ${foreshadowBoardStats.alert > 0 ? 'has-alert' : ''}`}
                   onClick={() => setEditorSidebarTab('foreshadow')}
+                  title={foreshadowBoardStats.alert > 0 ? `${foreshadowBoardStats.alert} 条伏笔埋设已久仍未回收` : '伏笔追踪'}
                 >
-                  伏笔追踪 <small>{foreshadowBoardStats.open}</small>
+                  伏笔追踪 <small>{foreshadowBoardStats.alert > 0 ? foreshadowBoardStats.alert : foreshadowBoardStats.open}</small>
                 </button>
                 <button
                   className={editorSidebarTab === 'publish' ? 'active' : ''}
@@ -6551,6 +6765,8 @@ function App() {
 
               {editorSidebarTab === 'review' && (() => {
                 const report = editingProject.reviewCenter;
+                const audit = editingProject.consistencyAudit;
+                const pendingAuditCount = audit?.conflicts.filter(conflict => !conflict.handled).length || 0;
                 const reportChapterCount = report?.chapters.length || 0;
                 const renderChapterPicker = () => <div className="review-chapter-picker"><div className="review-picker-toolbar"><strong>选择要审查的章节</strong><span>{selectedReviewChapterIds.length} / {editingProject.chapters.length} 已选</span><div><button type="button" className="link-button" onClick={() => setSelectedReviewChapterIds(editingProject.chapters.map(chapter => chapter.id))}>全选</button><button type="button" className="link-button" onClick={() => setSelectedReviewChapterIds([])}>清空</button></div></div>{editingProject.chapters.length ? editingProject.chapters.map((chapter, index) => <label className={`review-chapter-option ${selectedReviewChapterIds.includes(chapter.id) ? 'selected' : ''}`} key={chapter.id}><input type="checkbox" checked={selectedReviewChapterIds.includes(chapter.id)} onChange={() => setSelectedReviewChapterIds(current => current.includes(chapter.id) ? current.filter(id => id !== chapter.id) : [...current, chapter.id])} /><span><strong>{chapter.title || `第 ${index + 1} 章`}</strong><small>{chapter.wordCount.toLocaleString()} 字</small></span></label>) : <p className="empty-hint compact">当前作品还没有章节。</p>}</div>;
                 const renderReportNav = () => <div className="review-chapter-nav">{editingProject.chapters.map(chapter => {
@@ -6562,9 +6778,19 @@ function App() {
                   {reviewSidebarPage === 'home' && <>
                     <div className="panel-section-title">审查中心 <span>一致性与可读性</span></div>
                     <p className="review-center-intro">选择审查范围并开始检查，详细报告会在中间工作区展示。</p>
-                    <div className="review-scope-tabs"><button className={reviewScope === 'selected' ? 'active' : ''} onClick={() => { setReviewScope('selected'); setReviewSidebarPage('chapters'); }}>选择章节 <small>{selectedReviewChapterIds.length} 章</small></button><button className={reviewScope === 'book' ? 'active' : ''} onClick={() => { setReviewScope('book'); setReviewSidebarPage('home'); }}>全书 <small>{editingProject.chapters.length} 章</small></button></div>
-                    <div className="review-home-actions"><button type="button" className="btn-primary" disabled={reviewRunning} onClick={() => void runReviewCenter()}>{reviewRunning ? '审查中...' : reviewScope === 'book' ? '开始审查全书' : '开始审查已选章节'}</button>{reportChapterCount > 0 && <button type="button" className="btn-secondary" onClick={() => setReviewSidebarPage('reports')}>查看审查报告 <span>{reportChapterCount} 章</span></button>}</div>
-                    {!report && <p className="empty-hint compact">选择“选择章节”进入章节目录，或直接审查全书。</p>}
+                    <div className="review-scope-tabs">
+                      <button className={reviewScope === 'selected' ? 'active' : ''} onClick={() => { setReviewScope('selected'); setReviewSidebarPage('chapters'); }}>选择章节 <small>{selectedReviewChapterIds.length} 章</small></button>
+                      <button className={reviewScope === 'book' ? 'active' : ''} onClick={() => { setReviewScope('book'); setReviewSidebarPage('home'); }}>逐章全书 <small>{editingProject.chapters.length} 章</small></button>
+                      <button className={reviewScope === 'audit' ? 'active' : ''} onClick={() => { setReviewScope('audit'); setReviewSidebarPage('home'); }}>跨章巡检 <small>{pendingAuditCount} 条</small></button>
+                    </div>
+                    {reviewScope === 'audit' ? <>
+                      <div className="review-home-actions"><button type="button" className="btn-primary" disabled={bookAuditRunning} onClick={() => void runBookAudit()}>{bookAuditRunning ? '巡检中...' : pendingAuditCount ? '重新巡检全书' : '开始全书巡检'}</button></div>
+                      <p className="empty-hint compact">一次调用比对全书章节记忆与设定资料，只报告跨章节矛盾。单章内部问题请用「逐章全书」。</p>
+                      {audit && <p className="review-audit-stamp">上次巡检：{new Date(audit.auditedAt).toLocaleString()} · 覆盖 {audit.memoryCount} 条记忆</p>}
+                    </> : <>
+                      <div className="review-home-actions"><button type="button" className="btn-primary" disabled={reviewRunning} onClick={() => void runReviewCenter()}>{reviewRunning ? '审查中...' : reviewScope === 'book' ? '开始审查全书' : '开始审查已选章节'}</button>{reportChapterCount > 0 && <button type="button" className="btn-secondary" onClick={() => setReviewSidebarPage('reports')}>查看审查报告 <span>{reportChapterCount} 章</span></button>}</div>
+                      {!report && <p className="empty-hint compact">选择“选择章节”进入章节目录，或直接逐章审查全书。</p>}
+                    </>}
                   </>}
                   {reviewSidebarPage === 'chapters' && <>
                     <button type="button" className="review-back-button" onClick={() => setReviewSidebarPage('home')}>‹ 返回审查中心</button>
@@ -6798,6 +7024,53 @@ function App() {
                 const report = editingProject.reviewCenter;
                 const selectedReportChapterId = reviewActiveChapterId ?? report?.chapters[0]?.chapterId ?? activeChapter?.id ?? null;
                 const selectedReport = report?.chapters.find(item => item.chapterId === selectedReportChapterId) || null;
+                // 跨章巡检是独立结果集，与逐章审查报告互不覆盖。
+                if (reviewScope === 'audit') {
+                  const audit = editingProject.consistencyAudit;
+                  const severityLabels: Record<BookAuditConflict['severity'], string> = { high: '高优先级', medium: '中优先级', low: '低优先级' };
+                  const severityOrder: Record<BookAuditConflict['severity'], number> = { high: 0, medium: 1, low: 2 };
+                  const sortedConflicts = audit
+                    ? [...audit.conflicts].sort((left, right) =>
+                      Number(Boolean(left.handled)) - Number(Boolean(right.handled))
+                      || severityOrder[left.severity] - severityOrder[right.severity])
+                    : [];
+                  return <section className="review-workspace review-audit-workspace" aria-label="全书巡检工作区">
+                    <header className="review-workspace-header">
+                      <div><span>跨章一致性</span><h3>全书巡检</h3><p>只报告跨章节矛盾：人物、时间线、设定、称谓与伏笔断裂。</p></div>
+                      {audit && <small>巡检于 {new Date(audit.auditedAt).toLocaleString()}</small>}
+                    </header>
+                    {!audit ? <div className="review-workspace-empty"><strong>还没有巡检结果</strong><span>在左侧点击「开始全书巡检」。一次调用覆盖全书，成本远低于逐章审查。</span></div> : <div className="review-workspace-content">
+                      <div className="review-report-heading">
+                        <div><span>巡检结论</span><h4>{editingProject.title}</h4><p>{audit.summary}</p></div>
+                        <b className={audit.score >= 85 ? 'good' : audit.score >= 60 ? 'warn' : 'bad'}>{audit.score} 分</b>
+                      </div>
+                      <div className="review-audit-stats">
+                        <div><span>覆盖章节</span><b>{audit.chapterCount}</b></div>
+                        <div><span>比对记忆</span><b>{audit.memoryCount}</b></div>
+                        <div><span>未回收伏笔</span><b>{audit.foreshadowCount}</b></div>
+                        <div><span>待处理冲突</span><b>{audit.conflicts.filter(item => !item.handled).length}</b></div>
+                      </div>
+                      {!sortedConflicts.length ? <div className="review-clean-state"><strong>未发现明确的跨章矛盾</strong><span>人物、时间线与设定在记忆层面自洽。继续写作后可再次巡检。</span></div> : <div className="review-workspace-issues">
+                        <div className="review-section-heading"><strong>跨章冲突</strong><span>{audit.conflicts.filter(item => !item.handled).length} 条待处理 / 共 {audit.conflicts.length} 条</span></div>
+                        {sortedConflicts.map(conflict => {
+                          const conflictIndex = audit.conflicts.indexOf(conflict);
+                          return <article className={`review-workspace-issue audit ${conflict.severity} ${conflict.handled ? 'applied' : ''}`} key={`audit-${conflictIndex}`}>
+                            <div className="review-issue-heading">
+                              <div><span className="review-issue-severity">{severityLabels[conflict.severity]}</span><strong>{conflict.category}</strong></div>
+                              <div className="review-audit-issue-actions">
+                                {conflict.chapters.map(number => <button type="button" className="link-button" key={`audit-${conflictIndex}-ch-${number}`} onClick={() => openAuditChapter(number)}>第 {number} 章</button>)}
+                                <button type="button" className="btn-secondary review-issue-apply" onClick={() => toggleAuditConflictHandled(conflictIndex)}>{conflict.handled ? '已处理' : '标记已处理'}</button>
+                              </div>
+                            </div>
+                            {conflict.entities.length > 0 && <div className="review-audit-entities">{conflict.entities.map(entity => <span key={`audit-${conflictIndex}-${entity}`}>{entity}</span>)}</div>}
+                            <div className="review-issue-evidence"><span>冲突证据</span><p>{conflict.evidence || '巡检器未提供证据。'}</p></div>
+                            <div className="review-issue-suggestion"><span>修改建议</span><p>{conflict.suggestion || '暂无可执行建议。'}</p></div>
+                          </article>;
+                        })}
+                      </div>}
+                    </div>}
+                  </section>;
+                }
                 return <section className="review-workspace" aria-label="审查中心工作区">
                   <header className="review-workspace-header">
                     <div><span>一致性与可读性</span><h3>审查中心</h3><p>逐条查看证据与修改建议，只应用你确认的条目。</p></div>
@@ -6939,7 +7212,7 @@ function App() {
                 </section>
               ) : editorSidebarTab === 'foreshadow' ? (() => {
                 const statusLabels: Record<ForeshadowStatus, string> = { active: '未回收', progressing: '进行中', resolved: '已回收', overdue: '已超期', discarded: '已废弃' };
-                const filterLabels = { all: '全部', open: '未回收', overdue: '超期', resolved: '已回收', discarded: '已废弃' } as const;
+                const filterLabels = { all: '全部', alert: '待回收告警', open: '未回收', overdue: '超目标章', resolved: '已回收', discarded: '已废弃' } as const;
                 const setForeshadowStatus = (key: string, status: ForeshadowStatus) => updateEditorProject(project => ({
                   ...project,
                   foreshadowOverrides: { ...(project.foreshadowOverrides || {}), [key]: { status, updatedAt: new Date().toISOString() } },
@@ -6994,6 +7267,7 @@ function App() {
                 };
                 const filteredForeshadowItems = foreshadowBoardItems.filter(item => {
                   if (foreshadowFilter === 'all') return true;
+                  if (foreshadowFilter === 'alert') return isForeshadowAlert(item);
                   if (foreshadowFilter === 'open') return item.status === 'active' || item.status === 'progressing' || item.status === 'overdue';
                   if (foreshadowFilter === 'overdue') return item.overdue && item.status !== 'resolved' && item.status !== 'discarded';
                   return item.status === foreshadowFilter;
@@ -7014,13 +7288,53 @@ function App() {
                     </div>
                   </header>
                   <div className="foreshadow-stats" role="status">
+                    <div className={`foreshadow-stat alert ${foreshadowFilter === 'alert' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'alert' ? 'all' : 'alert')}><b>{foreshadowBoardStats.alert}</b><span>待回收告警</span></div>
                     <div className={`foreshadow-stat active ${foreshadowFilter === 'open' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'open' ? 'all' : 'open')}><b>{foreshadowBoardStats.active}</b><span>未回收</span></div>
                     <div className={`foreshadow-stat progressing ${foreshadowFilter === 'open' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'open' ? 'all' : 'open')}><b>{foreshadowBoardStats.progressing}</b><span>进行中</span></div>
-                    <div className={`foreshadow-stat overdue ${foreshadowFilter === 'overdue' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'overdue' ? 'all' : 'overdue')}><b>{foreshadowBoardStats.overdue}</b><span>已超期</span></div>
+                    <div className={`foreshadow-stat overdue ${foreshadowFilter === 'overdue' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'overdue' ? 'all' : 'overdue')}><b>{foreshadowBoardStats.overdue}</b><span>超目标章</span></div>
                     <div className={`foreshadow-stat resolved ${foreshadowFilter === 'resolved' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'resolved' ? 'all' : 'resolved')}><b>{foreshadowBoardStats.resolved}</b><span>已回收</span></div>
                     <div className={`foreshadow-stat discarded ${foreshadowFilter === 'discarded' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'discarded' ? 'all' : 'discarded')}><b>{foreshadowBoardStats.discarded}</b><span>已废弃</span></div>
                   </div>
-                  {foreshadowBoardStats.overdue > 0 && <div className="foreshadow-alert"><b>⚡ {foreshadowBoardStats.overdue} 根线头悬而未决</b><span>这些伏笔已超过目标章节仍未回收，读者可能已经忘了它——或者正在等它落地。建议在最近两章内安排回收。</span></div>}
+                  {foreshadowAlertItems.length > 0 ? <div className="foreshadow-alert" role="alert">
+                    <b>⚡ {foreshadowAlertItems.length} 根线头悬而未决</b>
+                    <span>
+                      {foreshadowBoardStats.overdue > 0 && `${foreshadowBoardStats.overdue} 条已超过目标章节；`}
+                      {foreshadowBoardStats.stale > 0 && `${foreshadowBoardStats.stale} 条埋设已超过 ${foreshadowAlertConfig.agingChapters} 章仍未回收；`}
+                      读者可能已经忘了它——或者正在等它落地。建议在最近两章内安排回收。
+                    </span>
+                    <div className="foreshadow-alert-list">
+                      {foreshadowAlertItems.slice(0, 5).map(item => (
+                        <button type="button" className="foreshadow-alert-item" key={item.key} onClick={() => { setForeshadowFilter('alert'); setEditingForeshadowKey(item.key); }}>
+                          <span>{item.text}</span>
+                          <small>{item.overdue ? `超出目标第${item.targetChapter}章` : `已过 ${item.agedChapters} 章`}{typeof item.plantedChapter === 'number' ? ` · 埋设第${item.plantedChapter}章` : ''}</small>
+                        </button>
+                      ))}
+                      {foreshadowAlertItems.length > 5 && <small className="foreshadow-alert-more">还有 {foreshadowAlertItems.length - 5} 条，点击上方「待回收告警」查看全部</small>}
+                    </div>
+                    <div className="foreshadow-alert-actions">
+                      <button className="btn-secondary" onClick={injectForeshadowAlertIntoInstruction}>写入本章指令</button>
+                      <button className="btn-secondary" onClick={() => void copyForeshadowAlertList()}>复制回收清单</button>
+                      <button className="link-button" onClick={() => setForeshadowFilter('alert')}>只看告警</button>
+                      <label className="foreshadow-alert-threshold">
+                        提醒阈值
+                        <input
+                          type="number"
+                          min={1}
+                          max={999}
+                          value={foreshadowAlertConfig.agingChapters}
+                          onChange={event => {
+                            const next = Math.max(1, Math.min(999, Math.round(Number(event.target.value)) || defaultForeshadowAlertConfig.agingChapters));
+                            updateEditorProject(project => ({ ...project, foreshadowAlertConfig: { enabled: true, agingChapters: next } }));
+                          }}
+                          onBlur={() => {
+                            const latest = projectsRef.current.find(project => project.id === editingProject.id);
+                            if (latest) void commitProjectUpdate(latest);
+                          }}
+                        />
+                        章
+                      </label>
+                    </div>
+                  </div> : foreshadowBoardItems.some(item => item.status !== 'resolved' && item.status !== 'discarded') && <div className="foreshadow-alert quiet"><b>✓ 暂时没有需要抢救的伏笔</b><span>当前没有超过目标章、也没有埋设超过 {foreshadowAlertConfig.agingChapters} 章仍未回收的线索。</span></div>}
                   {foreshadowView === 'board' ? <>
                     {showForeshadowForm && <div className="foreshadow-form">
                       <textarea className="input" rows={2} placeholder="伏笔内容，如：主角在第二章捡到的半块玉佩" value={foreshadowFormDraft.text} onChange={event => setForeshadowFormDraft(current => ({ ...current, text: event.target.value }))} />
@@ -7043,7 +7357,7 @@ function App() {
                       <span>{foreshadowFilter === 'all' ? '保存带正文的章节后，AI 记忆会自动提取伏笔；也可以点击右上角「登记伏笔」手动埋线。' : '换个筛选条件，或登记一条新伏笔。'}</span>
                     </div> : <div className="foreshadow-grid">
                       {filteredForeshadowItems.map(item => (
-                        <article className={`foreshadow-card status-${item.status} ${item.overdue ? 'is-overdue' : ''} ${editingForeshadowKey === item.key ? 'is-editing' : ''}`} key={item.key}>
+                        <article className={`foreshadow-card status-${item.status} ${item.overdue ? 'is-overdue' : ''} ${item.stale ? 'is-stale' : ''} ${editingForeshadowKey === item.key ? 'is-editing' : ''}`} key={item.key}>
                           <div className="foreshadow-card-top">
                             <span className={`foreshadow-badge ${item.status}`}>{statusLabels[item.status]}</span>
                             <small className="foreshadow-card-priority">{item.priority === 'high' ? '◆ 高优先' : item.priority === 'low' ? '◇ 低优先' : '◇ 普通'}</small>
@@ -7059,6 +7373,7 @@ function App() {
                             {item.manual ? '手动登记' : item.lastChapterTitle ? `最近更新：${item.lastChapterTitle}` : 'AI 提取'}
                             {typeof item.plantedChapter === 'number' && <b>埋设 第{item.plantedChapter}章</b>}
                             {typeof item.targetChapter === 'number' && <b className={item.overdue ? 'danger' : ''}>回收 第{item.targetChapter}章</b>}
+                            {item.stale && typeof item.agedChapters === 'number' && <b className="danger">已悬 {item.agedChapters} 章</b>}
                           </div>
                           <div className="foreshadow-card-actions">
                             {editingForeshadowKey !== item.key && item.status !== 'resolved' && <button className="link-button" onClick={() => setForeshadowStatus(item.sourceKey, 'resolved')}>✓ 标记已回收</button>}

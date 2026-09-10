@@ -398,6 +398,26 @@ const chapterReviewSystemPrompt = `你是长篇小说审查中心编辑。只依
 重点检查：章节与章纲是否一致、人物状态和认知是否前后一致、时间线与地点是否矛盾、设定和力量规则是否冲突、伏笔与冲突是否断裂、标题和结尾钩子是否有效、明显重复段落和病句。
 输出严格 JSON 对象，不要代码围栏或额外文字：{"score":0,"summary":"","issues":[{"severity":"high|medium|low","category":"","evidence":"原文短引","suggestion":"可执行修改建议"}],"suggestions":["..."]}。score 为 0-100；没有问题时 issues 为空。`;
 
+// 全书巡检与章节审查的分工：chapter.review 只看单章内部，本提示词只找跨章矛盾。
+// 输入是聚合后的章节记忆而非正文，因此单次调用即可覆盖全书，成本可控。
+const bookAuditSystemPrompt = `你是长篇网络小说的全书一致性巡检编辑。输入是同一部作品的全书聚合资料：固定设定（世界观、总纲、角色卡、金手指卡）、知识卡、按章节顺序排列的逐章记忆、未回收伏笔清单。
+你的唯一任务是找出**跨章节之间**的矛盾、断裂与遗漏。单章内部的文笔、语病、节奏问题由章节审查负责，不要在这里报告。
+重点检查以下六类：
+1. 人物矛盾：同一角色的称谓、身份、年龄、性格、能力前后不一致；已死亡或已退场的角色在后续章节仍以在场状态活动；职位或战力越级。
+2. 时间线矛盾：事件先后顺序颠倒；季节、日期、行程耗时对不上；同一角色同一时间出现在两地。
+3. 设定冲突：世界观规则或力量体系前后冲突；金手指的能力边界被突破；已确立的禁令或代价被违反。
+4. 称谓与专名：同一角色、地点或组织出现多个名称且正文未作解释。
+5. 伏笔断裂：埋设后长期无任何推进；回收时的结果与埋设时的描述不符；埋设过的线索被彻底遗忘。
+6. 无效重复：同一矛盾被反复书写却没有实质推进。
+
+输出必须是严格 JSON 对象，不要代码围栏或额外说明：
+{"score":0,"summary":"","conflicts":[{"severity":"high|medium|low","category":"人物|时间线|设定|称谓|伏笔","entities":["涉及的角色或设定名"],"evidence":"冲突短引并标明出处，如：第3章记为左臂受伤，第17章却用左手持剑","chapters":[3,17],"suggestion":"可直接执行的修改建议"}],"stats":{"checkedChapters":0}}
+约束：
+- 每条冲突必须给出至少两个章节出处，chapters 用章节序号；证据必须能在给定记忆中找到对应，不得臆造未提供的剧情。
+- 证据不足或只是风格偏好时不要写成冲突。宁可少报，也不要把猜测当事实。
+- score 为 0-100 的全书一致性健康度；没有任何冲突时 conflicts 为 [] 并在 summary 中说明本次覆盖的章节范围。
+- summary 用一段话说明巡检覆盖范围与整体结论，不超过 300 字。`;
+
 const stringList = (value: unknown, limit = 20): string[] => Array.isArray(value)
   ? value.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, limit)
   : [];
@@ -2505,6 +2525,187 @@ ${compactText(content, 26000)}
         } };
       } catch {
         return { id: req.id, result: { score: 0, summary: "审查结果解析失败，请重试。", issues: [], suggestions: [] } };
+      }
+    }
+    if (req.method === "book.audit") {
+      const {
+        projectTitle,
+        memories,
+        cards,
+        outlines,
+        foreshadowBoard,
+        chapterCount,
+        writtenChapterCount,
+        apiKey,
+        apiKeys,
+        baseURL,
+        model,
+        apiMode,
+        reasoningMode,
+        contextWindow,
+      } = req.params ?? {};
+      if (!projectTitle || !apiKey) {
+        return { id: req.id, error: { code: -32602, message: "缺少全书巡检所需参数" } };
+      }
+      const memoryList = Array.isArray(memories) ? memories.filter(item => item && typeof item === "object") : [];
+      if (!memoryList.length) {
+        return { id: req.id, result: {
+          score: 0,
+          summary: "当前作品还没有章节记忆。请先保存带正文的章节，让智能体生成记忆后再运行全书巡检。",
+          conflicts: [],
+          stats: { checkedChapters: 0, scannedMemories: 0, scannedForeshadows: 0 },
+        } };
+      }
+      const client = new ApiSaverClient({
+        apiKey: String(apiKey),
+        apiKeys: stringList(apiKeys, 12),
+        baseURL: String(baseURL || "https://api.apisaver.com/v1"),
+        defaultModel: String(model || "gpt-4o-mini"),
+        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        reasoningMode: String(reasoningMode || "auto"),
+        contextWindowKB: Number(contextWindow) || undefined,
+        ...networkProxyConfig(req.params),
+      });
+
+      const outlineList = Array.isArray(outlines) ? outlines.filter(item => item && typeof item === "object") : [];
+      const canonText = outlineList.length
+        ? outlineList.slice(0, 6).map(item => {
+          const outline = item as Record<string, unknown>;
+          const title = compactText(outline.title || outline.kind || "设定", 120);
+          const content = compactText(outline.content || "", 5200);
+          return title || content ? `### ${title}\n${content}` : "";
+        }).filter(Boolean).join("\n\n")
+        : "暂无世界观、总纲或章纲资料";
+
+      const cardList = Array.isArray(cards) ? cards.filter(item => item && typeof item === "object") : [];
+      const cardText = cardList.length
+        ? cardList.slice(0, 30).map(item => {
+          const card = item as Record<string, unknown>;
+          const type = compactText(card.type || "卡片", 40);
+          const title = compactText(card.title || "", 120);
+          const content = compactText(card.content || "", 900);
+          return title ? `- [${type}] ${title}：${content}` : "";
+        }).filter(Boolean).join("\n")
+        : "暂无知识卡";
+
+      // 每条记忆的总字节上限按条数反推，保证整段不超预算；逐条截断可保留章节顺序，
+      // 避免整段截断时丢掉中段章节、反而漏掉真正的跨章矛盾。
+      const buildMemoryBlock = (item: unknown, index: number) => {
+        const memory = item as Record<string, unknown>;
+        const numbered = Number(memory.sourceChapterNumber);
+        const chapterNumber = Number.isFinite(numbered) && numbered > 0 ? numbered : index + 1;
+        const parts = [`### 第${chapterNumber}章 ${compactText(memory.chapterTitle || "", 120)}`];
+        const pushList = (label: string, value: unknown, limit = 5) => {
+          const list = stringList(value, limit).map(text => compactText(text, 150));
+          if (list.length) parts.push(`- ${label}：${list.join("；")}`);
+        };
+        parts.push(`- 摘要：${compactText(memory.summary || "无", 420)}`);
+        pushList("人物状态", memory.characterStateChanges);
+        pushList("时间线", memory.timelineEvents);
+        pushList("设定事实", memory.canonFacts);
+        pushList("未解决冲突", memory.conflicts);
+        const hook = compactText(memory.endingHook || "", 150);
+        if (hook) parts.push(`- 结尾钩子：${hook}`);
+        const foreshadowItems = Array.isArray(memory.foreshadowingItems) ? memory.foreshadowingItems : [];
+        const foreshadows = foreshadowItems
+          .filter(entry => entry && typeof entry === "object")
+          .slice(0, 6)
+          .map(entry => {
+            const record = entry as Record<string, unknown>;
+            const text = compactText(record.text || "", 120);
+            if (!text) return "";
+            const status = compactText(record.status || "active", 40);
+            const target = typeof record.targetChapter === "number" ? `，目标第${record.targetChapter}章` : "";
+            return `${text}（${status}${target}）`;
+          })
+          .filter(Boolean);
+        if (foreshadows.length) parts.push(`- 本章伏笔：${foreshadows.join("；")}`);
+        return parts.join("\n");
+      };
+
+      const MEMORY_SECTION_BUDGET = 52000;
+      const memoryBlocks = memoryList.map(buildMemoryBlock);
+      const perMemoryBudget = Math.max(300, Math.floor(MEMORY_SECTION_BUDGET / memoryBlocks.length));
+      const memoryText = memoryBlocks.map(block => compactText(block, perMemoryBudget)).join("\n\n");
+
+      const boardList = Array.isArray(foreshadowBoard) ? foreshadowBoard.filter(item => item && typeof item === "object") : [];
+      const boardText = boardList.length
+        ? boardList.slice(0, 60).map(item => {
+          const record = item as Record<string, unknown>;
+          const flags: string[] = [];
+          if (record.overdue) flags.push("已超过目标章节");
+          if (record.stale) flags.push(`埋设已逾${compactText(record.agedChapters ?? "", 10)}章仍未回收`);
+          if (record.priority === "high") flags.push("高优先");
+          const planted = typeof record.plantedChapter === "number" ? `，埋设第${record.plantedChapter}章` : "";
+          const status = compactText(record.status || "active", 40);
+          const text = compactText(record.text || "", 160);
+          return text ? `- ${text}（${status}${planted}${flags.length ? `，${flags.join("、")}` : ""}）` : "";
+        }).filter(Boolean).join("\n")
+        : "暂无未回收伏笔";
+
+      const totalChapters = Number(chapterCount) || memoryList.length;
+      const writtenChapters = Number(writtenChapterCount) || memoryList.length;
+      const prompt = `## 作品：${compactText(projectTitle, 180)}
+## 规模
+- 章节总数：${totalChapters} 章
+- 已写正文：${writtenChapters} 章
+- 已生成章节记忆：${memoryList.length} 条
+- 未回收伏笔：${boardList.length} 条
+
+## 固定设定（世界观、总纲、章纲）
+${compactText(canonText, 14000)}
+
+## 知识卡（人物、地点、势力、物品、金手指）
+${compactText(cardText, 8000)}
+
+## 逐章记忆（严格按章节顺序）
+${memoryText}
+
+## 未回收伏笔清单
+${compactText(boardText, 3000)}
+
+请只报告跨章节之间的矛盾与断裂，按巡检规则输出 JSON。每条冲突必须给出至少两个章节出处，证据必须能在上面的记忆中找到对应；不得臆造未提供的章节内容。优先报告会让读者出戏的硬冲突。`;
+
+      const response = await client.chat([
+        { role: "system", content: bookAuditSystemPrompt },
+        { role: "user", content: prompt },
+      ], { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 2800, retryAttempts: 2 });
+      try {
+        const raw = JSON.parse(response.content) as Record<string, unknown>;
+        const conflicts = Array.isArray(raw.conflicts) ? raw.conflicts.filter(item => item && typeof item === "object").slice(0, 40).map(item => {
+          const conflict = item as Record<string, unknown>;
+          const severity = String(conflict.severity || "medium").toLowerCase();
+          const chapters = Array.isArray(conflict.chapters)
+            ? conflict.chapters
+              .map(value => Number(value))
+              .filter(value => Number.isFinite(value) && value > 0)
+              .slice(0, 8)
+            : [];
+          return {
+            severity: severity === "high" ? "high" : severity === "low" ? "low" : "medium",
+            category: compactText(conflict.category || "一致性", 40),
+            entities: stringList(conflict.entities, 8).map(text => compactText(text, 60)).filter(Boolean),
+            evidence: compactText(conflict.evidence || "", 400),
+            chapters,
+            suggestion: compactText(conflict.suggestion || conflict.fix || "", 600),
+          };
+        }).filter(item => item.evidence || item.suggestion) : [];
+        const highCount = conflicts.filter(item => item.severity === "high").length;
+        const mediumCount = conflicts.filter(item => item.severity === "medium").length;
+        return { id: req.id, result: {
+          score: Math.max(0, Math.min(100, Number(raw.score)
+            || (conflicts.length ? Math.max(38, 94 - highCount * 12 - mediumCount * 5 - (conflicts.length - highCount - mediumCount) * 2) : 96))),
+          summary: compactText(raw.summary || "全书巡检完成", 700),
+          conflicts,
+          stats: {
+            checkedChapters: writtenChapters,
+            scannedMemories: memoryList.length,
+            scannedForeshadows: boardList.length,
+          },
+        } };
+      } catch {
+        // 把解析失败伪装成「0 分、无冲突」会让作者以为全书没问题，风险远大于报错。
+        return { id: req.id, error: { code: -32603, message: "巡检结果不是有效 JSON，请重试或更换模型。" } };
       }
     }
     if (req.method === "chapter.write") {

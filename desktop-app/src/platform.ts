@@ -571,15 +571,17 @@ const recordUsage = (usage: unknown) => {
   try { localStorage.setItem(usageKey, JSON.stringify(next)); } catch { /* Keep the current request successful. */ }
 };
 
-const compactValue = (value: unknown, depth = 0): unknown => {
+// arrayLimit 由顶层调用决定：全书巡检需要跨章比对，只保留末尾 40 条会漏掉
+// 前面的章节，反而制造出「没发现问题」的假象。
+const compactValue = (value: unknown, depth = 0, arrayLimit = 40): unknown => {
   if (depth > 4) return '[已省略]';
   if (typeof value === 'string') return value.length > 18000 ? `${value.slice(0, 9000)}\n...[移动端上下文已压缩]...\n${value.slice(-7000)}` : value;
-  if (Array.isArray(value)) return value.slice(-40).map(item => compactValue(item, depth + 1));
+  if (Array.isArray(value)) return value.slice(-Math.max(1, arrayLimit)).map(item => compactValue(item, depth + 1, arrayLimit));
   if (!value || typeof value !== 'object') return value;
   const output: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
     if (/^(apiKey|apiKeys|proxyURL|proxyEnabled|proxyBypassLocal)$/u.test(key)) continue;
-    output[key] = compactValue(item, depth + 1);
+    output[key] = compactValue(item, depth + 1, arrayLimit);
   }
   return output;
 };
@@ -594,13 +596,16 @@ const schemaFor = (method: string) => {
     'book.dismantle': '{"summary":"剧情摘要","detailedOutline":"章节章纲","plotBeats":[],"characterDynamics":[],"setupPayoff":[],"pacing":""}',
     'book.style.distill': '{"name":"文风名称","description":"文风说明","tags":[],"content":"Markdown 文风 Skill"}',
     'skill.write': '{"name":"技能名称","category":"write","description":"技能用途","tags":[],"content":"Markdown 技能正文"}',
+    'book.audit': '{"score":0,"summary":"巡检结论","conflicts":[{"severity":"high|medium|low","category":"人物|时间线|设定|称谓|伏笔","entities":["涉及的角色或设定名"],"evidence":"冲突短引并标明章节出处","chapters":[3,17],"suggestion":"可执行的修改建议"}],"stats":{"checkedChapters":0}}',
   };
   return schemas[method] || '{"content":"处理结果"}';
 };
 
 const promptFor = (method: string, params: MobileParams) => {
-  const context = JSON.stringify(compactValue(params), null, 2);
-  const task = method === 'chapter.write'
+  const context = JSON.stringify(compactValue(params, 0, method === 'book.audit' ? 80 : 40), null, 2);
+  const task = method === 'book.audit'
+    ? '你是长篇小说全书一致性巡检编辑。输入是同一部作品的全书聚合资料：固定设定、知识卡、按章节顺序排列的逐章记忆、未回收伏笔清单。只找出跨章节之间的矛盾（人物、时间线、设定、称谓、伏笔断裂），不要报告单章内部的文笔或语病问题。每条冲突必须给出至少两个章节出处的 evidence 和 chapters，证据不足时不要写成冲突，宁可少报也不要把猜测当事实。'
+    : method === 'chapter.write'
     ? '你是中文长篇小说章节智能体。必须承接上一章结尾，严格遵守世界观、卡片、章纲和记忆，输出可直接保存的章节正文。不要输出分析过程。'
     : method === 'outline.write'
       ? '你是中文网文大纲智能体。根据作品资料与作者指令生成可执行的大纲，保持设定一致，不泄露总纲之外的未来情节。'
@@ -1507,17 +1512,18 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
     emitProgress(runId, { type: 'chunk', data: { text: chunk } });
   };
   let result: { content: string; usage?: unknown };
+  // 章节记忆与全书巡检都是后台结构化任务，不需要向编辑器推送字符流。部分中转站会
+  // 在 SSE 中切碎 JSON 或省略 delta.content，导致数组字段被解析为空。
+  // 使用一次完整 JSON 响应可稳定保留所有字段；章节、大纲和卡片仍保持流式。
+  const needsCompleteJson = method === 'memory.write' || method === 'book.audit';
   try {
-    // 章节记忆是后台结构化写入，不需要向编辑器推送字符流。部分中转站会
-    // 在 SSE 中切碎 JSON 或省略 delta.content，导致人物/认知等数组被解析为空。
-    // 使用一次完整 JSON 响应可稳定保留所有字段；章节、大纲和卡片仍保持流式。
-    result = await mobileChat(params, agentMessages, method === 'memory.write' ? undefined : onAgentChunk, method === 'memory.write');
+    result = await mobileChat(params, agentMessages, needsCompleteJson ? undefined : onAgentChunk, needsCompleteJson);
   } catch (error) {
     // A few OpenAI-compatible gateways reject response_format even though
-    // they support chat completions. Retry memory extraction without that
+    // they support chat completions. Retry structured extraction without that
     // optional hint; the prompt and alias normaliser still enforce JSON.
-    if (method !== 'memory.write' || !/response[_ ]format|json_object|400/iu.test(String(error))) throw error;
-    result = await mobileChat(params, agentMessages, method === 'memory.write' ? undefined : onAgentChunk, false);
+    if (!needsCompleteJson || !/response[_ ]format|json_object|400/iu.test(String(error))) throw error;
+    result = await mobileChat(params, agentMessages, needsCompleteJson ? undefined : onAgentChunk, false);
   }
   if (!result.content.trim()) throw new Error('模型没有返回内容');
   emitProgress(runId, { type: 'complete', data: { message: '移动端 Agent 已完成' } });
@@ -1530,6 +1536,9 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
     }
     return parsed as T;
   }
+  // 巡检结果必须是结构化 JSON。退化成纯文本会被上层读成「0 分、无冲突」，
+  // 比直接报错更危险，所以这里显式失败。
+  if (method === 'book.audit') throw new Error('巡检结果不是有效 JSON，请重试或更换模型。');
   if (method === 'chapter.write' || method === 'book.rewrite') return { content: result.content.trim() } as T;
   if (method === 'outline.write' || method === 'card.write') return { content: result.content.trim() } as T;
   return { content: result.content.trim() } as T;

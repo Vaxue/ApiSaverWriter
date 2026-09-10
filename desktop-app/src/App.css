@@ -811,7 +811,7 @@ main {
 .review-center-panel { display: grid; gap: 14px; padding: 18px; overflow: auto; }
 .review-center-intro { margin: 0; color: #94a3b8; font-size: 12px; line-height: 1.6; }
 .review-sidebar-panel { flex: 1; min-height: 0; overflow-y: auto; }
-.review-scope-tabs { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+.review-scope-tabs { display: grid; grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); gap: 6px; }
 .review-scope-tabs button { padding: 8px 10px; border: 1px solid #293a51; border-radius: 6px; background: #101a2b; color: #94a3b8; cursor: pointer; }
 .review-scope-tabs button.active { border-color: #38bdf8; background: #12304a; color: #e0f2fe; }
 .review-scope-tabs button { display: flex; align-items: center; justify-content: space-between; gap: 6px; text-align: left; }
@@ -3626,4 +3626,50 @@ select.input {
 @media (prefers-reduced-motion: reduce) {
   .foreshadow-card { animation: none; }
   .foreshadow-stat, .foreshadow-card, .foreshadow-timeline-chapter { transition: none; }
+}
+
+/* Foreshadow recovery alert ------------------------------------------------
+   Two things can make a thread overdue: a missed target chapter, or simply
+   sitting untouched for too long. Both funnel into one alert surface so the
+   author only has to watch a single number. */
+.foreshadow-stat.alert { --fs-color: #FBBF24; }
+.foreshadow-stat.alert b { color: #FBBF24; }
+.foreshadow-card.is-stale { border-color: rgba(251, 191, 36, .34); box-shadow: 0 0 24px rgba(251, 191, 36, .07); }
+
+.foreshadow-alert-list { display: grid; gap: 6px; margin: 9px 0 3px; }
+.foreshadow-alert-item { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; width: 100%; padding: 7px 10px; border: 1px solid rgba(248, 113, 113, .22); border-radius: 7px; background: rgba(12, 20, 36, .6); color: #F1D3D3; font-size: 12.5px; text-align: left; cursor: pointer; }
+.foreshadow-alert-item:hover { border-color: rgba(248, 113, 113, .5); background: rgba(24, 20, 34, .8); color: #FECACA; }
+.foreshadow-alert-item span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.foreshadow-alert-item small { flex: 0 0 auto; color: #B98A8A; font-size: 11px; white-space: nowrap; }
+.foreshadow-alert-more { color: #9A7B7B !important; font-size: 11px !important; }
+.foreshadow-alert-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; margin-top: 11px; padding-top: 11px; border-top: 1px solid rgba(248, 113, 113, .18); }
+.foreshadow-alert-actions .btn-secondary { min-height: 30px; padding: 5px 12px; font-size: 12px; }
+.foreshadow-alert-actions .link-button { font-size: 12px; }
+.foreshadow-alert-threshold { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; color: #B98A8A; font-size: 11.5px; }
+.foreshadow-alert-threshold input { width: 62px; padding: 5px 7px; border: 1px solid rgba(248, 113, 113, .3); border-radius: 6px; background: #0B1220; color: #F1D3D3; font-size: 12px; color-scheme: dark; }
+.foreshadow-alert.quiet { border-color: rgba(74, 222, 128, .28); background: linear-gradient(120deg, rgba(22, 101, 52, .18), rgba(22, 101, 52, .05)); box-shadow: none; }
+.foreshadow-alert.quiet b { color: #86EFAC; }
+.foreshadow-alert.quiet span { color: #8FBF9F; }
+
+.editor-tool-button.has-alert { border-color: rgba(251, 191, 36, .55); color: #FCD34D; background: rgba(120, 83, 12, .22); }
+.editor-tool-button.has-alert:hover { border-color: #FBBF24; background: rgba(120, 83, 12, .34); color: #FDE68A; }
+.editor-sidebar-tabs button.has-alert { color: #FCD34D; }
+.editor-sidebar-tabs button.has-alert small { color: #FBBF24; font-weight: 700; }
+
+/* Whole-book consistency audit -------------------------------------------- */
+.review-audit-stamp { margin: 2px 0 0; color: #64748B; font-size: 11px; }
+.review-audit-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 10px; padding: 14px 0 4px; }
+.review-audit-stats > div { display: grid; gap: 3px; padding: 11px 13px; border: 1px solid #1E293B; border-radius: 8px; background: #0D1726; }
+.review-audit-stats span { color: #94A3B8; font-size: 11px; }
+.review-audit-stats b { color: #E2E8F0; font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.review-audit-issue-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; }
+.review-audit-issue-actions .link-button { min-height: 26px; font-size: 11.5px; }
+.review-audit-entities { display: flex; flex-wrap: wrap; gap: 6px; }
+.review-audit-entities span { padding: 3px 9px; border: 1px solid #1E40AF; border-radius: 999px; background: rgba(30, 64, 175, .18); color: #93C5FD; font-size: 11px; }
+
+@media (max-width: 640px) {
+  .review-audit-issue-actions { width: 100%; }
+  .review-audit-issue-actions .review-issue-apply { width: 100%; }
+  .foreshadow-alert-threshold { margin-left: 0; }
+  .foreshadow-alert-item span { white-space: normal; }
 }

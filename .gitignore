@@ -36,3 +36,5 @@ output/playwright/
 __pycache__/
 *.pyc
 .toolchains/
+.trae/
+.workbuddy/
