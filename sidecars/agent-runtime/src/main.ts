@@ -451,6 +451,34 @@ function renderTargetNovelContext(params: Record<string, unknown> | undefined): 
   return `\n## 目标作品固定设定（优先级高于拆书素材）\n书名：${compactText(title || "未命名小说", 180)}\n简介：${synopsis}\n${world ? `\n### 世界观与作品设定\n${world}` : ""}${outlines ? `\n\n### 目标作品大纲\n${outlines}` : ""}\n\n### 自动匹配知识卡（角色卡、主角性格、金手指卡优先）\n${cardSection}${graphText ? `\n\n### 相关知识图谱\n${graphText}` : ""}${previous ? `\n\n### 上一章正文（只用于连续性）\n${previous}` : ""}${memories ? `\n\n### 上一章记忆\n${memories}` : ""}${documents ? `\n\n### 更早章节摘要\n${documents}` : ""}${skills ? `\n\n### 写作技能\n${skills}` : ""}${preferences ? `\n\n### 作者偏好\n${preferences}` : ""}\n\n硬性规则：角色卡、主角性格、金手指卡、世界观和上一章状态是目标作品的固定事实；拆书原文和参考作品只能提供抽象结构，禁止把其人名、专名、设定或事实带入目标作品。未知内容标记为“待揭示”，不得擅自改写固定卡片。`;
 }
 
+// 伏笔追踪板注入：把桌面端聚合的未回收伏笔渲染成 prompt 段落（确定性注入，不依赖检索命中）。
+interface ForeshadowBoardEntry {
+  text?: unknown;
+  status?: unknown;
+  priority?: unknown;
+  plantedChapter?: unknown;
+  targetChapter?: unknown;
+  due?: unknown;
+}
+
+const renderForeshadowBoardSection = (value: unknown): string => {
+  if (!Array.isArray(value) || !value.length) return "";
+  const statusLabels: Record<string, string> = { active: "未回收", progressing: "进行中", overdue: "已超期", resolved: "已回收", discarded: "已废弃" };
+  const lines = value.filter((item): item is ForeshadowBoardEntry => Boolean(item) && typeof item === "object").slice(0, 12).map(item => {
+    const text = compactText(String(item.text || ""), 160);
+    if (!text) return "";
+    const status = statusLabels[String(item.status || "active")] || "未回收";
+    const priority = item.priority === "high" ? "高优先" : item.priority === "low" ? "低优先" : "普通";
+    const planted = Number.isFinite(Number(item.plantedChapter)) ? `埋设于第 ${Number(item.plantedChapter)} 章` : "";
+    const target = Number.isFinite(Number(item.targetChapter)) ? `目标第 ${Number(item.targetChapter)} 章回收` : "";
+    const dueTag = item.due === true ? " ⚠ 本章到期" : "";
+    return `- ${text}（${status} · ${priority}${planted ? ` · ${planted}` : ""}${target ? ` · ${target}` : ""}）${dueTag}`;
+  }).filter(Boolean);
+  if (!lines.length) return "";
+  const dueCount = lines.filter(line => line.includes("本章到期")).length;
+  return `## 待回收伏笔清单（来自伏笔追踪板，最高优先级约束）\n${lines.join("\n")}\n\n${dueCount ? `其中 ${dueCount} 条已到目标回收章：必须在本章剧情中完成回收（揭晓或兑现），或至少实质性推进（强化线索、抬高代价）。` : "这些伏笔尚未到期：若与本章剧情自然相关可顺带推进，但不得强行堆积或提前泄底。"}`;
+};
+
 const memoryStringList = (value: unknown, limit = 40): string[] => Array.isArray(value)
   ? value.map(item => {
       if (typeof item === "string") return item.trim();
@@ -503,7 +531,7 @@ const normalizeMemoryResult = (content: string): Record<string, unknown> => {
       characterStateChanges: memoryStringList(memoryField(result, "characterStateChanges", "character_state_changes", "characterChanges", "character_changes", "人物状态变化", "人物状态", "角色状态变化")),
       knowledgeChanges: memoryStringList(memoryField(result, "knowledgeChanges", "knowledge_changes", "characterKnowledgeChanges", "roleKnowledgeChanges", "角色认知变化", "角色认知", "认知变化", "知识变化")),
       foreshadowingChanges: memoryStringList(memoryField(result, "foreshadowingChanges", "foreshadowing_changes", "伏笔变化", "伏笔进展")),
-      foreshadowingItems: Array.isArray(result.foreshadowingItems) ? result.foreshadowingItems.filter(item => item && typeof item === "object").slice(0, 20).map(item => {
+      foreshadowingItems: Array.isArray(result.foreshadowingItems) ? result.foreshadowingItems.filter(item => item && typeof item === "object").slice(0, 6).map(item => {
         const entry = item as Record<string, unknown>;
         return {
           text: compactText(entry.text || entry.content || entry.name || "", 260),
@@ -1872,6 +1900,11 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
   "cardUpdates": [{"cardId":"卡片 ID","cardTitle":"卡片名称","status":"changed|acquired|lost|revealed|updated","changes":"有正文依据的变化"}]
 }
 
+## 伏笔判定规则（foreshadowingItems 严格遵守）
+伏笔 = 作者有明确“埋设—回收”意图的线索：刻意安排的物品、信息、能力、承诺或异常细节，且正文能看出它将在未来章节被揭晓或兑现（如神秘玉佩的来历、角色隐瞒的身世、无端失效的能力、他人反常的态度）。
+以下一律不算伏笔，不得写入：正在进行的冲突或战斗；普通的未解决事件；日常描写与场景道具；情绪悬念（除非有明确兑现指向）；单纯的章末钩子（它属于 endingHook）。
+每条必须在正文中有可指认的埋设证据；只输出高置信条目，宁缺毋滥，通常 0 至 3 条，最多 6 条，没有就返回空数组。status 判定：本章首次埋设为 active；本章对已有伏笔进一步铺陈为 progressing；本章已揭晓或兑现为 resolved。已有伏笔若本章未提及，不要重复输出，保持原状由系统合并。
+
 关系 weight 为 0.1 到 1.0 的正文证据强度：明确行动、身份、持有或状态变化为 0.85 以上；直接提及为 0.65 至 0.8；推断性弱关联不超过 0.6。实体不超过 30 个，关系不超过 60 条；无内容使用空数组或空字符串。`;
       const optimizedResponse = await client.chat([
         { role: "system", content: memoryEditorSystemPrompt },
@@ -2293,7 +2326,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}
       }
     }
     if (req.method === "outline.write") {
-      const { projectTitle, kind, existingContent, instruction, synopsis, cards, knowledgeGraph, worldSetting, skills, preferredSkillNames, sessionId, previousSessionId, outlineId, targetChapter, sourceChapter, formatOutline, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      const { projectTitle, kind, existingContent, instruction, synopsis, cards, knowledgeGraph, worldSetting, skills, preferredSkillNames, sessionId, previousSessionId, outlineId, targetChapter, sourceChapter, formatOutline, foreshadowBoard, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
       if (!projectTitle || !kind || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
@@ -2392,7 +2425,8 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}
       const chapterLengthRule = kind === "章纲"
         ? "默认输出不超过700字（包括汉字、数字、空格、换行和标点符号）；压缩表达但不得丢失承接事实、冲突转折、释放点和章末钩子。"
         : "";
-      const dynamicTask = `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "根据上一章正文生成下一章章纲", 1800)}\n${chapterLengthRule}\n\n${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 标题要求（章纲必须执行）\n标题必须概括本章的核心事件、冲突或爽点，使用 8-24 个汉字或数字；不能只写“第${String(targetChapterNumber || "X")}章”、不能写“未命名”、不能直接复用上一章标题。标题要同时写入 Markdown 首行“# 章纲｜第X章 标题文字”，如果使用 JSON 包装，另返回非空的 title 字段。\n\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。章纲必须严格逐项填写固定输出协议，不能使用旧的“核心主线与目标”“核心冲突与节奏”“分段剧情梗概”“实体与关系更新”等替代栏目。旧草稿若与唯一正文依据或章节交接状态冲突，必须完全丢弃冲突部分并重写。若作者指令与历史会话冲突，以本次目标章、唯一正文依据、固定输出协议和作者指令为准。不要输出分析过程、格式说明或额外前言。`;
+      const foreshadowSection = renderForeshadowBoardSection(foreshadowBoard);
+      const dynamicTask = `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "根据上一章正文生成下一章章纲", 1800)}\n${chapterLengthRule}\n\n${foreshadowSection}${foreshadowSection ? "\n\n" : ""}${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 标题要求（章纲必须执行）\n标题必须概括本章的核心事件、冲突或爽点，使用 8-24 个汉字或数字；不能只写“第${String(targetChapterNumber || "X")}章”、不能写“未命名”、不能直接复用上一章标题。标题要同时写入 Markdown 首行“# 章纲｜第X章 标题文字”，如果使用 JSON 包装，另返回非空的 title 字段。\n\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。章纲必须严格逐项填写固定输出协议，不能使用旧的“核心主线与目标”“核心冲突与节奏”“分段剧情梗概”“实体与关系更新”等替代栏目。旧草稿若与唯一正文依据或章节交接状态冲突，必须完全丢弃冲突部分并重写。若作者指令与历史会话冲突，以本次目标章、唯一正文依据、固定输出协议和作者指令为准。不要输出分析过程、格式说明或额外前言。`;
       emitter.progress("plan", 48, isNextChapterHandoff ? "步骤 3/5：根据交接状态规划本章事件链与冲突升级" : sourceChapterNumber === targetChapterNumber ? "步骤 3/5：从本章正文提取事件链、冲突与伏笔" : "步骤 3/5：校验指定正文与目标章的事实边界");
       emitter.context("plan", isNextChapterHandoff ? "正在校验上一章结束状态，阻止重复事件" : sourceChapterNumber === targetChapterNumber ? "正在从本章正文提取已发生事件，避免虚构后续" : "正在校验指定正文与目标章的事实边界", { source: isNextChapterHandoff ? "章纲承接规范" : "正文事实校验", status: "loaded", bytes: byteLength(sourceHandoff), items: sourceChapterRecord ? 1 : 0 });
       emitter.progress("draft", 62, "步骤 4/5：调用模型生成章纲正文");
@@ -2650,6 +2684,7 @@ ${compactText(content, 26000)}
           earlierMemorySummary: earlierMemorySummary ? String(earlierMemorySummary.content || "") : undefined,
           knowledgeGraph: prepared.knowledgeGraph,
           cards: prepared.cards,
+          foreshadowBoard: renderForeshadowBoardSection(req.params?.foreshadowBoard),
           skillCatalog: prepared.skills,
           preferredSkillNames: stringList(preferredSkillNames, 8),
           contextReport,

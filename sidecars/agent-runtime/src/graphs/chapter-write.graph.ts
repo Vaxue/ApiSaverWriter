@@ -78,7 +78,7 @@ function chapterSummaryFromEnvelope(value: unknown, depth = 0): string {
 
 const chapterReviewSystemPrompt = `你是长篇小说一致性编辑。审查时只依据给出的约束与章节正文，不做文风重写，也不虚构问题。
 
-重点检查：人物状态、已知信息、时间线、实体关系、物品归属和剧情因果。返回严格 JSON 对象，不要代码围栏或解释：{"consistent":true,"issues":["明确矛盾"],"suggestions":["可执行修订建议"]}。没有明确问题时 issues 和 suggestions 返回空数组。`;
+重点检查：人物状态、已知信息、时间线、实体关系、物品归属和剧情因果。若给出“待回收伏笔清单”，额外检查其中标注“⚠ 本章到期”的伏笔：正文既未回收也未实质推进时，在 suggestions 中给出一条低优先级的补线建议（在 issues 中只记录真正的矛盾）。返回严格 JSON 对象，不要代码围栏或解释：{"consistent":true,"issues":["明确矛盾"],"suggestions":["可执行修订建议"]}。没有明确问题时 issues 和 suggestions 返回空数组。`;
 
 const chapterPlanSystemPrompt = `你是长篇网络小说主编。先为下一章制作一份短小、可执行的写作计划，不写正文，不输出隐藏思考。
 只依据给定资料，优先处理上一章结尾。返回严格 JSON 对象：{"plan":"人类可读的 Markdown 计划","handoff":"下一章交接"}。plan 字段必须直接是普通 Markdown 文字，绝不能在 plan 字段中再次嵌套 JSON、JSON 字符串、代码围栏或字段对象。
@@ -289,6 +289,7 @@ export const ChapterState = Annotation.Root({
   earlierMemorySummary: Annotation<string | undefined>,
   knowledgeGraph: Annotation<string | undefined>,
   cards: Annotation<Array<{ type?: string; title: string; content: string }> | undefined>,
+  foreshadowBoard: Annotation<string | undefined>,
   skillCatalog: Annotation<SkillDefinition[]>({ reducer: (_prev, next) => next, default: () => [] }),
   preferredSkillNames: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
   selectedSkills: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
@@ -529,13 +530,14 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const planPrompt = [
         state.outline ? "## 章节细纲\n" + compactText(state.outline, scaleCap(1800)) : "",
         state.continuityContext ? "## 上一章承接（最高优先级）\n" + compactText(state.continuityContext, scaleCap(3200)) : "",
+        state.foreshadowBoard ? "## 待回收伏笔清单（来自伏笔追踪板）\n" + compactText(state.foreshadowBoard, scaleCap(1800)) : "",
         state.earlierMemorySummary ? "## 更早章节压缩摘要（仅作连续性参考）\n" + compactText(state.earlierMemorySummary, scaleCap(4200)) : "",
         state.retrievedContext.length ? "## 结构化记忆\n" + compactText(state.retrievedContext.join("\n\n"), scaleCap(2600)) : "",
         state.knowledgeGraph ? "## 相关知识图谱\n" + compactText(state.knowledgeGraph, scaleCap(1800)) : "",
         skillSection ? "## 执行技能\n" + skillSection : "",
         state.prewriteCheck?.warnings.length ? `## 写前提醒\n${state.prewriteCheck.warnings.map(item => `- ${item}`).join("\n")}` : "",
       ].filter(Boolean).join("\n\n");
-      const planInstruction = `${chapterPlanSystemPrompt}\n\n## 本章任务\n${state.instruction}\n\n请输出一份 600 字以内的五段写作任务书，计划是正文生成的硬约束。格式固定为：1. 开篇承接；2. 这章的故事；3. 这章的人物；4. 怎么写更顺（节奏、文风、禁区）；5. 收在哪里（章末钩子）。`;
+      const planInstruction = `${chapterPlanSystemPrompt}\n\n## 本章任务\n${state.instruction}\n\n请输出一份 600 字以内的五段写作任务书，计划是正文生成的硬约束。格式固定为：1. 开篇承接；2. 这章的故事；3. 这章的人物；4. 怎么写更顺（节奏、文风、禁区）；5. 收在哪里（章末钩子）。${state.foreshadowBoard ? "\n\n伏笔纪律：待回收伏笔清单中标注“⚠ 本章到期”的条目，必须写入本章事件链并完成回收（揭晓或兑现）或实质性推进（强化线索、抬高代价）；未到期的伏笔可自然带过，不得强行堆积或提前泄底。" : ""}`;
       const response = await client.chat([
         { role: "system", content: chapterAgentSystemPrompt },
         { role: "user", content: `## 稳定作品资料\n${stablePacket || "（暂无稳定资料）"}` },
@@ -582,6 +584,9 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const earlierMemorySection = state.earlierMemorySummary
         ? `\n## 更早章节压缩摘要（只用于补足连续性，不得覆盖上一章）\n${state.earlierMemorySummary}\n`
         : "";
+      const foreshadowSection = state.foreshadowBoard
+        ? `\n## 待回收伏笔清单（来自伏笔追踪板）\n${state.foreshadowBoard}\n`
+        : "";
       const planSection = state.chapterPlan ? `\n## 下一章计划（必须执行）\n${state.chapterPlan}\n` : "";
       // Keep project facts first and byte-stable; only the dynamic turn changes after it.
       const stablePacket = stableProjectPacket(state);
@@ -591,7 +596,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const mutableProjectContext = [skillsSection, outlineSection, cardsSection, graphSection].filter(Boolean).join("");
       // Keep the stable project facts first, then the durable session handoff;
       // chapter-specific material follows so upstream prefix caches remain stable.
-      const dynamicPacket = [mutableProjectContext, continuitySection, earlierMemorySection, planSection, contextSection].filter(Boolean).join("");
+      const dynamicPacket = [mutableProjectContext, continuitySection, earlierMemorySection, foreshadowSection, planSection, contextSection].filter(Boolean).join("");
       emitter?.context("draft", "组装稳定设定与动态上下文", { source: "ContextAssembler", status: "loaded", bytes: byteLength(dynamicPacket), items: state.selectedSkills.length + (state.cards?.length || 0) });
       const hasPreviousChapter = Boolean(state.previousChapters?.some(chapter => chapter?.content?.trim()));
       const continuityInstruction = hasPreviousChapter
@@ -648,8 +653,11 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const earlierMemorySection = state.earlierMemorySummary
         ? `\n## 更早章节压缩摘要\n${state.earlierMemorySummary}\n`
         : "";
+      const foreshadowSection = state.foreshadowBoard
+        ? `\n## 待回收伏笔清单（来自伏笔追踪板）\n${state.foreshadowBoard}\n`
+        : "";
 
-      const reviewConstraints = `${cardsSection}${graphSection}${earlierMemorySection}${contextSection}`;
+      const reviewConstraints = `${cardsSection}${graphSection}${earlierMemorySection}${foreshadowSection}${contextSection}`;
       // 正文与卡片全文注入：审查找的是事实矛盾，截断会让章节尾部与状态细节逃过检查。
       const reviewDraft = state.draftContent;
       const reviewPrompt = `## 约束摘要\n${reviewConstraints || "（暂无额外约束）"}\n\n## 待审查章节\n${reviewDraft}`;

@@ -183,12 +183,15 @@ interface ForeshadowManualEntry {
 }
 
 interface ForeshadowOverride {
-  status: ForeshadowStatus;
+  status?: ForeshadowStatus;
+  text?: string;
+  hidden?: boolean;
   updatedAt: string;
 }
 
 interface ForeshadowBoardItem {
   key: string;
+  sourceKey: string;
   text: string;
   status: ForeshadowStatus;
   priority: 'high' | 'normal' | 'low';
@@ -894,7 +897,7 @@ const aggregateForeshadowBoard = (project: Project): ForeshadowBoardItem[] => {
     if (!key) return;
     const existing = aggregated.get(key);
     if (!existing) {
-      aggregated.set(key, { key, text: text.trim(), status: 'active', priority: 'normal', manual: false, overdue: false, ...source });
+      aggregated.set(key, { key, sourceKey: key, text: text.trim(), status: 'active', priority: 'normal', manual: false, overdue: false, ...source });
       return;
     }
     if (source.status) existing.status = source.status;
@@ -936,11 +939,13 @@ const aggregateForeshadowBoard = (project: Project): ForeshadowBoardItem[] => {
   }
   const overrides = project.foreshadowOverrides || {};
   return [...aggregated.values()]
+    .filter(item => !overrides[item.key]?.hidden)
     .map(item => {
       const override = overrides[item.key];
-      const status = override ? override.status : item.status;
+      const renamed = override?.text?.trim() ? override.text.trim() : '';
+      const status = override?.status || item.status;
       const overdue = (status === 'active' || status === 'progressing') && typeof item.targetChapter === 'number' && item.targetChapter < writtenChapterCount;
-      return { ...item, status, overdue: overdue || status === 'overdue' };
+      return { ...item, key: renamed ? normalizeForeshadowKey(renamed) : item.key, sourceKey: item.key, text: renamed || item.text, status, overdue: overdue || status === 'overdue' };
     })
     .sort((left, right) =>
       FORESHADOW_STATUS_ORDER[left.status] - FORESHADOW_STATUS_ORDER[right.status]
@@ -968,6 +973,20 @@ const aggregateTimeline = (project: Project): TimelineChapterEntry[] => {
 };
 
 const localResourceId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+// 生成管线注入用：未回收伏笔清单（确定性注入，不依赖检索命中）
+const foreshadowBoardPayload = (project: Project, currentChapterNumber?: number) =>
+  aggregateForeshadowBoard(project)
+    .filter(item => item.status !== 'resolved' && item.status !== 'discarded')
+    .slice(0, 12)
+    .map(item => ({
+      text: item.text,
+      status: item.status,
+      priority: item.priority,
+      plantedChapter: item.plantedChapter,
+      targetChapter: item.targetChapter,
+      due: typeof item.targetChapter === 'number' && typeof currentChapterNumber === 'number' && item.targetChapter <= currentChapterNumber,
+    }));
 
 const splitTxtIntoDismantleChapters = (text: string): Array<{ title: string; sourceContent: string }> => {
   const cleaned = text.replace(/^\uFEFF/u, '').replace(/\r\n/gu, '\n').trim();
@@ -1709,6 +1728,8 @@ function App() {
   const [foreshadowFilter, setForeshadowFilter] = useState<'all' | 'open' | 'overdue' | 'resolved' | 'discarded'>('all');
   const [showForeshadowForm, setShowForeshadowForm] = useState(false);
   const [foreshadowFormDraft, setForeshadowFormDraft] = useState<{ text: string; priority: ForeshadowPriority; plantedChapter: string; targetChapter: string }>({ text: '', priority: 'normal', plantedChapter: '', targetChapter: '' });
+  const [editingForeshadowKey, setEditingForeshadowKey] = useState<string | null>(null);
+  const [editingForeshadowDraft, setEditingForeshadowDraft] = useState('');
   const foreshadowBoardItems = useMemo(() => (editingProject ? aggregateForeshadowBoard(editingProject) : []), [editingProject]);
   const foreshadowTimelineEntries = useMemo(() => (editingProject ? aggregateTimeline(editingProject) : []), [editingProject]);
   const foreshadowBoardStats = useMemo(() => ({
@@ -4626,6 +4647,7 @@ function App() {
           sourceChapter: { id: chapter.id, number: chapterNumber, title: chapter.title, content: chapter.content, mode: '保存章节自动同步本章章纲' },
           synopsis: baseProject.synopsis,
           cards: baseProject.cards.slice(0, 10),
+          foreshadowBoard: foreshadowBoardPayload(baseProject, chapterNumber),
           knowledgeGraph: { nodes: baseProject.graphNodes, edges: baseProject.graphEdges },
           worldSetting: baseProject.outlines.filter(item => item.kind === '世界观与作品设定').map(item => ({ id: item.id, title: item.title, content: item.content })),
           skills: skills.map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
@@ -4819,6 +4841,7 @@ function App() {
           instruction: activeStyle ? `${outlineAgentInstruction.trim()}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : outlineAgentInstruction.trim(),
           synopsis: editingProject.synopsis,
           cards: editingProject.cards.filter(card => selectedOutlineCardIds.includes(card.id)),
+          foreshadowBoard: foreshadowBoardPayload(editingProject, chapterNumberFromText(targetOutline.title) || undefined),
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
           worldSetting: editingProject.outlines
             .filter(item => item.kind === '世界观与作品设定' && item.content.trim())
@@ -4911,6 +4934,7 @@ function App() {
             sourceChapter: previous ? { id: previous.id, number: chapterNumber - 1, title: previous.title, content: previous.content, mode: '批量生成默认上一章正文' } : undefined,
             synopsis: working.synopsis,
             cards: working.cards.slice(0, 10),
+            foreshadowBoard: foreshadowBoardPayload(working, chapterNumber),
             knowledgeGraph: { nodes: working.graphNodes, edges: working.graphEdges },
             worldSetting: working.outlines.filter(item => item.kind === '世界观与作品设定').map(item => ({ id: item.id, title: item.title, content: item.content })),
             writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
@@ -4939,6 +4963,7 @@ function App() {
               { id: outline.id, kind: outline.kind, title: outline.title, chapterId: outline.chapterId, content: outline.content },
             ], activeOutlineId: outline.id,
             cards: [...autoCards, ...working.cards.filter(card => !autoCards.some(item => item.id === card.id))].slice(0, 10),
+            foreshadowBoard: foreshadowBoardPayload(working, chapterNumber),
             knowledgeGraph: { nodes: working.graphNodes, edges: working.graphEdges },
             previousChapters: previous ? [{ id: previous.id, title: previous.title, content: previous.content }] : [],
             memories: previous ? working.memories.filter(memory => memory.chapterId === previous.id).map(memory => ({ id: memory.id, title: memory.chapterTitle, summary: memory.summary, keywords: memory.keywords, characterStateChanges: memory.characterStateChanges, knowledgeChanges: memory.knowledgeChanges, foreshadowingChanges: memory.foreshadowingChanges, timelineEvents: memory.timelineEvents, canonFacts: memory.canonFacts, conflicts: memory.conflicts, endingHook: memory.endingHook })) : [],
@@ -5468,6 +5493,7 @@ function App() {
           activeOutlineId: currentChapterOutline?.id,
           outline: selectedOutlineIds.includes(currentChapterOutline?.id ?? -1) ? currentChapterOutline?.content || '' : '',
           cards: editingProject.cards.filter(card => resolvedCardIds.includes(card.id)).sort((left, right) => left.id - right.id).slice(0, 10),
+          foreshadowBoard: foreshadowBoardPayload(editingProject, chapterNumberFromText(activeChapter.title) || editingProject.chapters.findIndex(chapter => chapter.id === activeChapter.id) + 1),
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
           skills: [...agentSkills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])]
             .map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : skill.name, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
@@ -6721,111 +6747,6 @@ function App() {
                 </div>
               )}
 
-              {editorSidebarTab === 'foreshadow' && (() => {
-                const statusLabels: Record<ForeshadowStatus, string> = { active: '未回收', progressing: '进行中', resolved: '已回收', overdue: '已超期', discarded: '已废弃' };
-                const filterLabels = { all: '全部', open: '未回收', overdue: '超期', resolved: '已回收', discarded: '已废弃' } as const;
-                const setForeshadowStatus = (key: string, status: ForeshadowStatus) => updateEditorProject(project => ({
-                  ...project,
-                  foreshadowOverrides: { ...(project.foreshadowOverrides || {}), [key]: { status, updatedAt: new Date().toISOString() } },
-                }));
-                const clearForeshadowOverride = (key: string) => updateEditorProject(project => {
-                  const overrides = { ...(project.foreshadowOverrides || {}) };
-                  delete overrides[key];
-                  return { ...project, foreshadowOverrides: overrides };
-                });
-                const deleteManualForeshadow = (item: ForeshadowBoardItem) => updateEditorProject(project => ({
-                  ...project,
-                  manualForeshadows: (project.manualForeshadows || []).filter(entry => normalizeForeshadowKey(entry.text) !== item.key),
-                }));
-                const submitForeshadowForm = () => {
-                  const text = foreshadowFormDraft.text.trim();
-                  if (!text) return;
-                  const entry: ForeshadowManualEntry = {
-                    id: localResourceId('foreshadow'),
-                    text,
-                    priority: foreshadowFormDraft.priority,
-                    plantedChapter: Number(foreshadowFormDraft.plantedChapter) || undefined,
-                    targetChapter: Number(foreshadowFormDraft.targetChapter) || undefined,
-                    createdAt: new Date().toISOString(),
-                  };
-                  updateEditorProject(project => ({ ...project, manualForeshadows: [...(project.manualForeshadows || []), entry] }));
-                  setForeshadowFormDraft({ text: '', priority: 'normal', plantedChapter: '', targetChapter: '' });
-                  setShowForeshadowForm(false);
-                };
-                const filteredForeshadowItems = foreshadowBoardItems.filter(item => {
-                  if (foreshadowFilter === 'all') return true;
-                  if (foreshadowFilter === 'open') return item.status === 'active' || item.status === 'progressing' || item.status === 'overdue';
-                  if (foreshadowFilter === 'overdue') return item.overdue && item.status !== 'resolved' && item.status !== 'discarded';
-                  return item.status === foreshadowFilter;
-                });
-                return <div className="foreshadow-panel">
-                  <div className="foreshadow-header">
-                    <div><span>伏笔与时间线</span><h3>伏笔追踪</h3><small>保存章节后自动从 AI 记忆提取伏笔，也可手动登记。及时回收伏笔能显著提升追读体验。</small></div>
-                    <div className="foreshadow-view-tabs">
-                      <button className={foreshadowView === 'board' ? 'active' : ''} onClick={() => setForeshadowView('board')}>看板</button>
-                      <button className={foreshadowView === 'timeline' ? 'active' : ''} onClick={() => setForeshadowView('timeline')}>时间线</button>
-                    </div>
-                  </div>
-                  {foreshadowView === 'board' ? <>
-                    <div className="foreshadow-stats">
-                      <span className="active">未回收 <b>{foreshadowBoardStats.active}</b></span>
-                      <span className="progressing">进行中 <b>{foreshadowBoardStats.progressing}</b></span>
-                      <span className="overdue">已超期 <b>{foreshadowBoardStats.overdue}</b></span>
-                      <span className="resolved">已回收 <b>{foreshadowBoardStats.resolved}</b></span>
-                      <span className="discarded">已废弃 <b>{foreshadowBoardStats.discarded}</b></span>
-                    </div>
-                    {foreshadowBoardStats.overdue > 0 && <div className="foreshadow-alert">有 {foreshadowBoardStats.overdue} 个伏笔已超过目标章节仍未回收，建议尽快安排回收剧情。</div>}
-                    <div className="foreshadow-actions">
-                      <div className="foreshadow-filter">
-                        {(Object.keys(filterLabels) as Array<keyof typeof filterLabels>).map(filter => (
-                          <button key={filter} className={foreshadowFilter === filter ? 'active' : ''} onClick={() => setForeshadowFilter(filter)}>{filterLabels[filter]}</button>
-                        ))}
-                      </div>
-                      <button className="btn-primary foreshadow-add-button" onClick={() => setShowForeshadowForm(current => !current)}>{showForeshadowForm ? '收起' : '+ 登记伏笔'}</button>
-                    </div>
-                    {showForeshadowForm && <div className="foreshadow-form">
-                      <textarea className="input" rows={2} placeholder="伏笔内容，如：主角在第二章捡到的半块玉佩" value={foreshadowFormDraft.text} onChange={event => setForeshadowFormDraft(current => ({ ...current, text: event.target.value }))} />
-                      <div className="foreshadow-form-row">
-                        <label>优先级<select className="select" value={foreshadowFormDraft.priority} onChange={event => setForeshadowFormDraft(current => ({ ...current, priority: event.target.value as ForeshadowPriority }))}><option value="high">高</option><option value="normal">中</option><option value="low">低</option></select></label>
-                        <label>埋设章<input className="input" type="number" min={1} placeholder="如 2" value={foreshadowFormDraft.plantedChapter} onChange={event => setForeshadowFormDraft(current => ({ ...current, plantedChapter: event.target.value }))} /></label>
-                        <label>目标回收章<input className="input" type="number" min={1} placeholder="如 20" value={foreshadowFormDraft.targetChapter} onChange={event => setForeshadowFormDraft(current => ({ ...current, targetChapter: event.target.value }))} /></label>
-                        <button className="btn-primary" disabled={!foreshadowFormDraft.text.trim()} onClick={submitForeshadowForm}>登记</button>
-                      </div>
-                    </div>}
-                    <div className="foreshadow-list">
-                      {filteredForeshadowItems.length === 0 ? <p className="empty-hint">暂无伏笔记录。保存带正文的章节后，AI 记忆会自动提取伏笔；也可以手动登记。</p> : filteredForeshadowItems.map(item => (
-                        <div className={`foreshadow-item status-${item.status} ${item.overdue ? 'is-overdue' : ''}`} key={item.key}>
-                          <div className="foreshadow-item-main">
-                            <p>{item.text}</p>
-                            <small>
-                              {item.manual ? '手动登记' : item.lastChapterTitle ? `最近更新：${item.lastChapterTitle}` : 'AI 提取'}
-                              {typeof item.plantedChapter === 'number' && ` · 埋设于第 ${item.plantedChapter} 章`}
-                              {typeof item.targetChapter === 'number' && ` · 目标第 ${item.targetChapter} 章`}
-                              {' · '}{item.priority === 'high' ? '高优先' : item.priority === 'low' ? '低优先' : '普通优先'}
-                            </small>
-                          </div>
-                          <span className={`foreshadow-badge ${item.status}`}>{statusLabels[item.status]}</span>
-                          <div className="foreshadow-item-actions">
-                            {item.status !== 'resolved' && <button className="link-button" onClick={() => setForeshadowStatus(item.key, 'resolved')}>标记已回收</button>}
-                            {item.status !== 'progressing' && item.status !== 'resolved' && item.status !== 'discarded' && <button className="link-button" onClick={() => setForeshadowStatus(item.key, 'progressing')}>推进中</button>}
-                            {item.status !== 'discarded' && <button className="link-button" onClick={() => setForeshadowStatus(item.key, 'discarded')}>废弃</button>}
-                            {editingProject.foreshadowOverrides?.[item.key] && <button className="link-button" onClick={() => clearForeshadowOverride(item.key)}>恢复 AI 判定</button>}
-                            {item.manual && <button className="link-button danger" onClick={() => deleteManualForeshadow(item)}>删除</button>}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </> : <div className="timeline-list">
-                    {foreshadowTimelineEntries.length === 0 ? <p className="empty-hint">暂无时间线事件。保存带正文的章节后，会按章节聚合展示事件。</p> : foreshadowTimelineEntries.map(entry => (
-                      <div className="timeline-entry" key={entry.chapterId}>
-                        <button type="button" className="timeline-chapter" onClick={() => { const target = editingProject.chapters.find(chapter => chapter.id === entry.chapterId); if (target) setActiveChapter(target); }}>{entry.chapterTitle}</button>
-                        <ul>{entry.events.map((event, index) => <li key={index}>{event}</li>)}</ul>
-                      </div>
-                    ))}
-                  </div>}
-                </div>;
-              })()}
-
               {editorSidebarTab === 'knowledge' && (
                 <div className="knowledge-panel">
                   <div className="knowledge-toolbar">
@@ -7016,7 +6937,151 @@ function App() {
                     </>}
                   </>}
                 </section>
-              ) : editorSidebarTab === 'knowledge' && activeMemoryDocumentId === memoryDocumentId('章节快照') && activeChapterMemory ? (
+              ) : editorSidebarTab === 'foreshadow' ? (() => {
+                const statusLabels: Record<ForeshadowStatus, string> = { active: '未回收', progressing: '进行中', resolved: '已回收', overdue: '已超期', discarded: '已废弃' };
+                const filterLabels = { all: '全部', open: '未回收', overdue: '超期', resolved: '已回收', discarded: '已废弃' } as const;
+                const setForeshadowStatus = (key: string, status: ForeshadowStatus) => updateEditorProject(project => ({
+                  ...project,
+                  foreshadowOverrides: { ...(project.foreshadowOverrides || {}), [key]: { status, updatedAt: new Date().toISOString() } },
+                }));
+                const clearForeshadowOverride = (key: string) => updateEditorProject(project => {
+                  const overrides = { ...(project.foreshadowOverrides || {}) };
+                  delete overrides[key];
+                  return { ...project, foreshadowOverrides: overrides };
+                });
+                const deleteManualForeshadow = (item: ForeshadowBoardItem) => updateEditorProject(project => ({
+                  ...project,
+                  manualForeshadows: (project.manualForeshadows || []).filter(entry => normalizeForeshadowKey(entry.text) !== item.sourceKey),
+                }));
+                const hideForeshadowItem = (item: ForeshadowBoardItem) => updateEditorProject(project => ({
+                  ...project,
+                  foreshadowOverrides: { ...(project.foreshadowOverrides || {}), [item.sourceKey]: { ...(project.foreshadowOverrides?.[item.sourceKey] || {}), hidden: true, updatedAt: new Date().toISOString() } as ForeshadowOverride },
+                }));
+                const startForeshadowEdit = (item: ForeshadowBoardItem) => {
+                  setEditingForeshadowKey(item.key);
+                  setEditingForeshadowDraft(item.text);
+                };
+                const saveForeshadowEdit = (item: ForeshadowBoardItem) => {
+                  const text = editingForeshadowDraft.trim();
+                  if (!text) return;
+                  if (item.manual) {
+                    updateEditorProject(project => ({
+                      ...project,
+                      manualForeshadows: (project.manualForeshadows || []).map(entry => normalizeForeshadowKey(entry.text) === item.sourceKey ? { ...entry, text } : entry),
+                    }));
+                  } else {
+                    updateEditorProject(project => ({
+                      ...project,
+                      foreshadowOverrides: { ...(project.foreshadowOverrides || {}), [item.sourceKey]: { ...(project.foreshadowOverrides?.[item.sourceKey] || {}), text, updatedAt: new Date().toISOString() } as ForeshadowOverride },
+                    }));
+                  }
+                  setEditingForeshadowKey(null);
+                };
+                const submitForeshadowForm = () => {
+                  const text = foreshadowFormDraft.text.trim();
+                  if (!text) return;
+                  const entry: ForeshadowManualEntry = {
+                    id: localResourceId('foreshadow'),
+                    text,
+                    priority: foreshadowFormDraft.priority,
+                    plantedChapter: Number(foreshadowFormDraft.plantedChapter) || undefined,
+                    targetChapter: Number(foreshadowFormDraft.targetChapter) || undefined,
+                    createdAt: new Date().toISOString(),
+                  };
+                  updateEditorProject(project => ({ ...project, manualForeshadows: [...(project.manualForeshadows || []), entry] }));
+                  setForeshadowFormDraft({ text: '', priority: 'normal', plantedChapter: '', targetChapter: '' });
+                  setShowForeshadowForm(false);
+                };
+                const filteredForeshadowItems = foreshadowBoardItems.filter(item => {
+                  if (foreshadowFilter === 'all') return true;
+                  if (foreshadowFilter === 'open') return item.status === 'active' || item.status === 'progressing' || item.status === 'overdue';
+                  if (foreshadowFilter === 'overdue') return item.overdue && item.status !== 'resolved' && item.status !== 'discarded';
+                  return item.status === foreshadowFilter;
+                });
+                return <section className="foreshadow-workspace" aria-label="伏笔与时间线">
+                  <header className="foreshadow-workspace-header">
+                    <div className="foreshadow-workspace-title">
+                      <span>Story Threads</span>
+                      <h3>伏笔追踪</h3>
+                      <p>保存章节后自动从 AI 记忆提取，也可手动登记。埋下的每一根线，都要有收回来的那一针。</p>
+                    </div>
+                    <div className="foreshadow-workspace-actions">
+                      <div className="foreshadow-view-tabs" role="tablist" aria-label="视图切换">
+                        <button className={foreshadowView === 'board' ? 'active' : ''} onClick={() => setForeshadowView('board')}>看板</button>
+                        <button className={foreshadowView === 'timeline' ? 'active' : ''} onClick={() => setForeshadowView('timeline')}>时间线</button>
+                      </div>
+                      {foreshadowView === 'board' && <button className="btn-primary foreshadow-add-button" onClick={() => setShowForeshadowForm(current => !current)}>{showForeshadowForm ? '收起表单' : '+ 登记伏笔'}</button>}
+                    </div>
+                  </header>
+                  <div className="foreshadow-stats" role="status">
+                    <div className={`foreshadow-stat active ${foreshadowFilter === 'open' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'open' ? 'all' : 'open')}><b>{foreshadowBoardStats.active}</b><span>未回收</span></div>
+                    <div className={`foreshadow-stat progressing ${foreshadowFilter === 'open' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'open' ? 'all' : 'open')}><b>{foreshadowBoardStats.progressing}</b><span>进行中</span></div>
+                    <div className={`foreshadow-stat overdue ${foreshadowFilter === 'overdue' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'overdue' ? 'all' : 'overdue')}><b>{foreshadowBoardStats.overdue}</b><span>已超期</span></div>
+                    <div className={`foreshadow-stat resolved ${foreshadowFilter === 'resolved' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'resolved' ? 'all' : 'resolved')}><b>{foreshadowBoardStats.resolved}</b><span>已回收</span></div>
+                    <div className={`foreshadow-stat discarded ${foreshadowFilter === 'discarded' ? 'selected' : ''}`} onClick={() => setForeshadowFilter(foreshadowFilter === 'discarded' ? 'all' : 'discarded')}><b>{foreshadowBoardStats.discarded}</b><span>已废弃</span></div>
+                  </div>
+                  {foreshadowBoardStats.overdue > 0 && <div className="foreshadow-alert"><b>⚡ {foreshadowBoardStats.overdue} 根线头悬而未决</b><span>这些伏笔已超过目标章节仍未回收，读者可能已经忘了它——或者正在等它落地。建议在最近两章内安排回收。</span></div>}
+                  {foreshadowView === 'board' ? <>
+                    {showForeshadowForm && <div className="foreshadow-form">
+                      <textarea className="input" rows={2} placeholder="伏笔内容，如：主角在第二章捡到的半块玉佩" value={foreshadowFormDraft.text} onChange={event => setForeshadowFormDraft(current => ({ ...current, text: event.target.value }))} />
+                      <div className="foreshadow-form-row">
+                        <label>优先级<select className="select" value={foreshadowFormDraft.priority} onChange={event => setForeshadowFormDraft(current => ({ ...current, priority: event.target.value as ForeshadowPriority }))}><option value="high">高</option><option value="normal">中</option><option value="low">低</option></select></label>
+                        <label>埋设章<input className="input" type="number" min={1} placeholder="如 2" value={foreshadowFormDraft.plantedChapter} onChange={event => setForeshadowFormDraft(current => ({ ...current, plantedChapter: event.target.value }))} /></label>
+                        <label>目标回收章<input className="input" type="number" min={1} placeholder="如 20" value={foreshadowFormDraft.targetChapter} onChange={event => setForeshadowFormDraft(current => ({ ...current, targetChapter: event.target.value }))} /></label>
+                        <button className="btn-primary" disabled={!foreshadowFormDraft.text.trim()} onClick={submitForeshadowForm}>登记</button>
+                      </div>
+                    </div>}
+                    <div className="foreshadow-filter">
+                      {(Object.keys(filterLabels) as Array<keyof typeof filterLabels>).map(filter => (
+                        <button key={filter} className={foreshadowFilter === filter ? 'active' : ''} onClick={() => setForeshadowFilter(filter)}>{filterLabels[filter]}</button>
+                      ))}
+                      <small>{filteredForeshadowItems.length} 条{foreshadowFilter !== 'all' ? ` · ${filterLabels[foreshadowFilter]}` : ''}</small>
+                    </div>
+                    {filteredForeshadowItems.length === 0 ? <div className="foreshadow-empty">
+                      <b>✦</b>
+                      <strong>{foreshadowFilter === 'all' ? '尚无伏笔登记' : '当前筛选下没有伏笔'}</strong>
+                      <span>{foreshadowFilter === 'all' ? '保存带正文的章节后，AI 记忆会自动提取伏笔；也可以点击右上角「登记伏笔」手动埋线。' : '换个筛选条件，或登记一条新伏笔。'}</span>
+                    </div> : <div className="foreshadow-grid">
+                      {filteredForeshadowItems.map(item => (
+                        <article className={`foreshadow-card status-${item.status} ${item.overdue ? 'is-overdue' : ''} ${editingForeshadowKey === item.key ? 'is-editing' : ''}`} key={item.key}>
+                          <div className="foreshadow-card-top">
+                            <span className={`foreshadow-badge ${item.status}`}>{statusLabels[item.status]}</span>
+                            <small className="foreshadow-card-priority">{item.priority === 'high' ? '◆ 高优先' : item.priority === 'low' ? '◇ 低优先' : '◇ 普通'}</small>
+                          </div>
+                          {editingForeshadowKey === item.key ? <div className="foreshadow-card-edit">
+                            <textarea className="input" rows={3} value={editingForeshadowDraft} autoFocus onChange={event => setEditingForeshadowDraft(event.target.value)} />
+                            <div className="foreshadow-card-edit-actions">
+                              <button className="btn-primary" disabled={!editingForeshadowDraft.trim()} onClick={() => saveForeshadowEdit(item)}>保存</button>
+                              <button className="link-button" onClick={() => setEditingForeshadowKey(null)}>取消</button>
+                            </div>
+                          </div> : <p className="foreshadow-card-text">{item.text}</p>}
+                          <div className="foreshadow-card-meta">
+                            {item.manual ? '手动登记' : item.lastChapterTitle ? `最近更新：${item.lastChapterTitle}` : 'AI 提取'}
+                            {typeof item.plantedChapter === 'number' && <b>埋设 第{item.plantedChapter}章</b>}
+                            {typeof item.targetChapter === 'number' && <b className={item.overdue ? 'danger' : ''}>回收 第{item.targetChapter}章</b>}
+                          </div>
+                          <div className="foreshadow-card-actions">
+                            {editingForeshadowKey !== item.key && item.status !== 'resolved' && <button className="link-button" onClick={() => setForeshadowStatus(item.sourceKey, 'resolved')}>✓ 标记已回收</button>}
+                            {editingForeshadowKey !== item.key && item.status !== 'progressing' && item.status !== 'resolved' && item.status !== 'discarded' && <button className="link-button" onClick={() => setForeshadowStatus(item.sourceKey, 'progressing')}>推进中</button>}
+                            {editingForeshadowKey !== item.key && item.status !== 'discarded' && <button className="link-button" onClick={() => setForeshadowStatus(item.sourceKey, 'discarded')}>废弃</button>}
+                            <button className="link-button" onClick={() => startForeshadowEdit(item)}>编辑</button>
+                            {!item.manual && <button className="link-button danger" onClick={() => hideForeshadowItem(item)}>删除</button>}
+                            {item.manual && <button className="link-button danger" onClick={() => deleteManualForeshadow(item)}>删除</button>}
+                            {editingProject.foreshadowOverrides?.[item.sourceKey] && <button className="link-button" onClick={() => clearForeshadowOverride(item.sourceKey)}>恢复 AI 判定</button>}
+                          </div>
+                        </article>
+                      ))}
+                    </div>}
+                  </> : <div className="foreshadow-timeline">
+                    {foreshadowTimelineEntries.length === 0 ? <div className="foreshadow-empty"><b>✦</b><strong>暂无时间线事件</strong><span>保存带正文的章节后，会按章节聚合展示事件。</span></div> : foreshadowTimelineEntries.map(entry => (
+                      <div className="foreshadow-timeline-entry" key={entry.chapterId}>
+                        <button type="button" className="foreshadow-timeline-chapter" onClick={() => { const target = editingProject.chapters.find(chapter => chapter.id === entry.chapterId); if (target) setActiveChapter(target); }}>{entry.chapterTitle}<small>打开章节 ›</small></button>
+                        <ul>{entry.events.map((event, index) => <li key={index}>{event}</li>)}</ul>
+                      </div>
+                    ))}
+                  </div>}
+                </section>;
+              })() : editorSidebarTab === 'knowledge' && activeMemoryDocumentId === memoryDocumentId('章节快照') && activeChapterMemory ? (
                 <section className="memory-snapshot-editor">
                   <div className="memory-document-header">
                     <div><span>逐章记忆快照</span><h3>{activeChapterMemory.chapterTitle}</h3></div>
