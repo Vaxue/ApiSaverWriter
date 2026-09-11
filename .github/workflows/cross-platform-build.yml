@@ -65,6 +65,8 @@ jobs:
         run: brew install cocoapods xcodegen libimobiledevice
       - run: npm ci
       - run: npm ci --prefix desktop-app
+      - name: Verify book sources consistency
+        run: npm run check:book-sources
       - name: Build Windows
         if: matrix.kind == 'windows'
         run: npm run tauri:build --prefix desktop-app

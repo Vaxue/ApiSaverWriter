@@ -2,6 +2,14 @@
 
 All notable changes to ApiSaverWriter will be documented in this file.
 
+## [Unreleased]
+
+### 维护
+
+- 移除 v0.1.0 遗留的孤立代码（`src/`、`schema/`、`tests/novel-writer.test.ts`）与早期 Web 原型残留（根目录 `index.html`/`app.js`/`styles.css`），这些代码已无任何引用，实际逻辑由 `sidecars/agent-runtime` 提供。
+- 将 14 份过时进度/交付文档归档至 `docs/archive/`，根目录仅保留仍有效的 README、ARCHITECTURE、CHANGELOG 等文档。
+- 建立书源数据单一源同步机制（`npm run sync:book-sources` / `check:book-sources`），并在 release 构建中校验 `qianyue-novel-sources.json` 两份拷贝的一致性。
+
 ## [0.1.6] - 2026-09-04
 
 ### 修复与优化

@@ -8,6 +8,8 @@
     "test": "npm --workspace @apisaverwriter/agent-runtime test",
     "typecheck": "npm --workspace @apisaverwriter/agent-runtime run typecheck",
     "dev:agent": "npm --workspace @apisaverwriter/agent-runtime run dev",
-    "sync:feishu-release": "node scripts/sync-feishu-release.mjs"
+    "sync:feishu-release": "node scripts/sync-feishu-release.mjs",
+    "sync:book-sources": "node scripts/sync-book-sources.mjs sync",
+    "check:book-sources": "node scripts/sync-book-sources.mjs check"
   }
 }
