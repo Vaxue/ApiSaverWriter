@@ -182,6 +182,9 @@ jobs:
         with:
           tag_name: ${{ inputs.release_tag || github.ref_name }}
           generate_release_notes: true
+          # 重新发布同一版本（例如修正 Android 签名密钥）时，必须覆盖 Release 里
+          # 已有的同名安装包，否则 action-gh-release 会因资产重名直接报错。
+          overwrite_files: true
           files: release-assets/*
       - name: Publish install packages to public distribution repository
         env:
