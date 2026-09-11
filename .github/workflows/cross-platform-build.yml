@@ -134,7 +134,7 @@ jobs:
         shell: bash
         env:
           ANDROID_BUILD_TOOLS_VERSION: 35.0.0
-          ANDROID_VERSION_CODE: 14
+          ANDROID_VERSION_CODE: 15
           ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/apisaverwriter-release.jks
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}

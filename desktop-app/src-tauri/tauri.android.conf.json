@@ -1,6 +1,6 @@
 {
   "bundle": {
     "resources": [],
-    "android": { "minSdkVersion": 26, "versionCode": 14 }
+    "android": { "minSdkVersion": 26, "versionCode": 15 }
   }
 }

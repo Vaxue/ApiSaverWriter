@@ -6,7 +6,7 @@ android_outputs="${ANDROID_OUTPUTS_DIR:-$project_root/desktop-app/src-tauri/gen/
 release_dir="${1:-$project_root/release-assets}"
 release_tag="${2:-v0.1.4}"
 build_tools_version="${ANDROID_BUILD_TOOLS_VERSION:-35.0.0}"
-expected_version_code="${ANDROID_VERSION_CODE:-14}"
+expected_version_code="${ANDROID_VERSION_CODE:-15}"
 expected_version_name="${ANDROID_VERSION_NAME:-${release_tag#v}}"
 
 : "${ANDROID_HOME:=${ANDROID_SDK_ROOT:-}}"
