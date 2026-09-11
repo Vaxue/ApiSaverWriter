@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const docUrl = process.env.FEISHU_DOC_URL || 'https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa';
 const tag = process.env.RELEASE_TAG || process.env.GITHUB_REF_NAME || '';
@@ -15,6 +18,26 @@ const parseJson = (text) => {
   try { return JSON.parse(text); } catch { return {}; }
 };
 
+// 版本说明必须取自 CHANGELOG 中对应版本的段落。此前这里写死了几条 v0.1.4
+// 时期的条目，导致同步到飞书的内容与本次实际发布毫无关系。
+const changelogSection = (version) => {
+  const changelogPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'CHANGELOG.md');
+  let text = '';
+  try { text = readFileSync(changelogPath, 'utf8'); } catch { return ''; }
+  const heading = new RegExp(`^##\\s*\\[?v?${version.replace(/\./g, '\\.')}\\]?`);
+  const collected = [];
+  let inside = false;
+  for (const line of text.split('\n')) {
+    if (line.startsWith('## ')) {
+      if (inside) break;
+      inside = heading.test(line);
+      continue;
+    }
+    if (inside) collected.push(line);
+  }
+  return collected.join('\n').trim();
+};
+
 const releaseResponse = await fetch(`https://api.github.com/repos/${repository}/releases/tags/${encodeURIComponent(tag)}`, {
   headers: { Accept: 'application/vnd.github+json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
 });
@@ -22,16 +45,12 @@ if (!releaseResponse.ok) throw new Error(`GitHub Release 查询失败：HTTP ${r
 const release = await releaseResponse.json();
 const assets = Array.isArray(release.assets) ? release.assets : [];
 const downloadBase = `https://github.com/${downloadRepository}/releases/download/${encodeURIComponent(tag)}`;
+const version = tag.replace(/^v/, '');
+const section = changelogSection(version);
 const lines = [
   `\n\n## ${tag}（${new Date().toISOString().slice(0, 10)}）`,
   '',
-  '### 更新内容',
-  '- 使用教程改为飞书文档入口，客服入口统一为“联系客服”。',
-  '- 下载小说时按书源完整目录获取，不再限制最多 200 章。',
-  '- TXT 导入兼容 `第1章`、`1、标题`、`1. 标题`、`1 标题`、`Chapter 1` 等章节格式。',
-  '- 猫眼看书优+书源遇到过期授权或 403 时自动清理旧授权并重试。',
-  '- 新增审查中心，支持当前章、勾选章节和全书审查，可按建议让 AI 修改正文并自动同步章纲。',
-  '- 保存章节时自动创建或更新对应章纲，异步合并最新项目状态，避免正文与章纲脱节。',
+  section || '### 更新内容\n- 详见 GitHub Release 说明。',
   '',
   '### 安装包下载',
   ...(assets.length ? assets.map(asset => `- [${asset.name}](${downloadBase}/${encodeURIComponent(asset.name)})`) : ['- 安装包正在准备中，请稍后刷新本页。']),
